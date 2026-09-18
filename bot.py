@@ -559,7 +559,30 @@ def format_admin_order(row):
 
 
 def is_admin_chat(update: Update):
-    return bool(ADMIN_CHAT_ID and update.effective_chat and update.effective_chat.id == ADMIN_CHAT_ID)
+    return bool(
+        ADMIN_CHAT_IDS
+        and update.effective_chat
+        and update.effective_chat.id in ADMIN_CHAT_IDS
+    )
+
+
+async def send_to_admin_chats(context: ContextTypes.DEFAULT_TYPE, text, **kwargs):
+    """Send a manager notification to every configured admin chat.
+
+    Each chat is attempted independently so one invalid/blocked chat does not
+    prevent the other managers from receiving the notification.
+    Returns (successful_count, failed_chat_ids).
+    """
+    sent = 0
+    failed = []
+    for chat_id in ADMIN_CHAT_IDS:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            sent += 1
+        except Exception:
+            failed.append(chat_id)
+            logger.exception("Failed to send manager notification to chat %s", chat_id)
+    return sent, failed
 
 
 def format_client_order(row):
@@ -1453,25 +1476,36 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     admin_status = ""
-    if ADMIN_CHAT_ID:
-        try:
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=format_admin_order(row), parse_mode="Markdown", reply_markup=admin_keyboard(order_id))
+    if ADMIN_CHAT_IDS:
+        sent, failed = await send_to_admin_chats(
+            context,
+            format_admin_order(row),
+            parse_mode="Markdown",
+            reply_markup=admin_keyboard(order_id),
+        )
+        if sent:
             if len(applicable) > 1:
                 context.application.bot_data.setdefault("pending_credentials", {})[order_id] = credentials_text
                 choice_kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("➕ Сложить проценты", callback_data=f"discount_sum:{order_id}")],
                     [InlineKeyboardButton("🔄 Последовательно", callback_data=f"discount_seq:{order_id}")],
                 ])
-                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=format_discount_choice(order_id, applicable), parse_mode="Markdown", reply_markup=choice_kb)
-                admin_status = "Заявка отправлена менеджеру. Менеджер выберет способ применения скидок."
+                await send_to_admin_chats(
+                    context,
+                    format_discount_choice(order_id, applicable),
+                    parse_mode="Markdown",
+                    reply_markup=choice_kb,
+                )
+                admin_status = "Заявка отправлена менеджерам. Менеджер выберет способ применения скидок."
             else:
-                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=credentials_text)
+                await send_to_admin_chats(context, credentials_text)
                 admin_status = "Заявка и данные для входа отправлены менеджерам."
-        except Exception:
-            logger.exception("Failed to send order to ADMIN_CHAT_ID")
-            admin_status = "⚠️ Заказ сохранён, но не удалось отправить его в чат менеджеров. Проверь ADMIN_CHAT_ID."
+            if failed:
+                admin_status += " ⚠️ Не удалось отправить одному из чатов менеджеров."
+        else:
+            admin_status = "⚠️ Заказ сохранён, но не удалось отправить его в чаты менеджеров. Проверь ADMIN_CHAT_IDS."
     else:
-        admin_status = "⚠️ ADMIN_CHAT_ID пока не настроен."
+        admin_status = "⚠️ ADMIN_CHAT_IDS пока не настроен."
 
     username_mgr = MANAGER_USERNAME.strip().lstrip("@")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Связаться с менеджером", url=f"https://t.me/{username_mgr}")], [InlineKeyboardButton("🏠 Главное меню", callback_data="back")]])
@@ -1577,11 +1611,8 @@ async def apply_order_discount_choice(update: Update, context: ContextTypes.DEFA
 
     # Credentials are kept only in process memory until the manager resolves the discount.
     pending = context.application.bot_data.get("pending_credentials", {}).pop(order_id, None)
-    if pending and ADMIN_CHAT_ID:
-        try:
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=pending)
-        except Exception:
-            logger.exception("Failed to send delayed credentials for order %s", order_id)
+    if pending and ADMIN_CHAT_IDS:
+        await send_to_admin_chats(context, pending)
 
 
 async def order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
