@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -111,26 +112,60 @@ def create_sqlite_backup_bytes():
         return target.read_bytes()
 
 
+def create_code_backup_bytes():
+    """Создаёт ZIP-снимок исходного кода и служебных файлов проекта."""
+    excluded_names = {
+        "orders.db", "orders_history.db",
+        "orders (2).db", "orders (3).db", "orders (4).db", "orders (5).db",
+    }
+    allowed_suffixes = {".py", ".md", ".txt", ".toml", ".yaml", ".yml", ".json", ".ini", ".gitattributes", ".gitignore"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "fishl_shop_code.zip"
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for source_path in sorted(BASE_DIR.rglob("*")):
+                if not source_path.is_file():
+                    continue
+                relative = source_path.relative_to(BASE_DIR)
+                if any(part in {".git", "__pycache__"} for part in relative.parts):
+                    continue
+                if source_path.name in excluded_names or source_path.suffix.lower() == ".db":
+                    continue
+                if source_path.suffix.lower() not in allowed_suffixes and source_path.name not in {"requirements.txt", "Dockerfile"}:
+                    continue
+                zf.write(source_path, relative.as_posix())
+        return archive.read_bytes()
+
+
 def upload_github_backup():
-    """Загружает новый snapshot БД в отдельную ветку GitHub."""
+    """Загружает согласованный snapshot БД и ZIP-снимок кода в отдельную ветку GitHub."""
     if not github_backup_enabled():
         return False
-    content = create_sqlite_backup_bytes()
-    if not content:
+
+    db_content = create_sqlite_backup_bytes()
+    if not db_content:
         logger.warning("GitHub backup skipped: orders.db отсутствует")
         return False
 
+    code_content = create_code_backup_bytes()
     ensure_github_backup_branch()
     owner, repo = GITHUB_REPO.split("/", 1)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = f"{GITHUB_BACKUP_PATH.strip('/').strip()}/orders_{timestamp}.db"
-    payload = {
-        "message": f"Backup orders.db {timestamp}",
-        "content": base64.b64encode(content).decode("ascii"),
-        "branch": GITHUB_BACKUP_BRANCH,
-    }
-    github_api("PUT", f"/repos/{owner}/{repo}/contents/{path}", payload)
-    logger.info("GitHub backup uploaded: %s:%s", GITHUB_BACKUP_BRANCH, path)
+    branch = GITHUB_BACKUP_BRANCH
+    root = GITHUB_BACKUP_PATH.strip("/").strip()
+
+    uploads = [
+        (f"{root}/orders_{timestamp}.db", db_content, f"Backup orders.db {timestamp}"),
+        (f"{root}/../code/code_{timestamp}.zip", code_content, f"Backup bot code {timestamp}"),
+    ]
+    for path, content, message in uploads:
+        payload = {
+            "message": message,
+            "content": base64.b64encode(content).decode("ascii"),
+            "branch": branch,
+        }
+        github_api("PUT", f"/repos/{owner}/{repo}/contents/{path}", payload)
+        logger.info("GitHub backup uploaded: %s:%s", branch, path)
     return True
 
 
@@ -257,12 +292,15 @@ def db():
             threshold REAL DEFAULT 0,
             service TEXT DEFAULT '',
             percent REAL NOT NULL,
+            value_type TEXT NOT NULL DEFAULT '%',
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             expires_at TEXT DEFAULT NULL
         )
     """)
     dcols = {row[1] for row in conn.execute("PRAGMA table_info(discounts)").fetchall()}
+    if "value_type" not in dcols:
+        conn.execute("ALTER TABLE discounts ADD COLUMN value_type TEXT NOT NULL DEFAULT '%'")
     if "expires_at" not in dcols:
         conn.execute("ALTER TABLE discounts ADD COLUMN expires_at TEXT DEFAULT NULL")
     conn.commit()
@@ -458,6 +496,11 @@ def discount_kind_label(row):
         return f"На заказ от {format_price(row['threshold'])} ₽"
     return f"На услугу: {row['service']}"
 
+def discount_value_label(row):
+    value_type = row["value_type"] if "value_type" in row.keys() else "%"
+    suffix = "%" if value_type == "%" else " ₽"
+    return f"{format_price(row['percent'])}{suffix}"
+
 def discount_period_label(row):
     return "без срока" if not row["expires_at"] else f"до {row['expires_at']}"
 
@@ -485,27 +528,41 @@ def get_applicable_discounts(order):
 
 
 def calculate_discount(base_price, discounts, mode="sequential"):
-    """Calculate discount. sequential = general first, then service; summed = sum percentages."""
+    """Calculate fixed-ruble and percentage discounts.
+    Sequential applies each rule in order; summed combines fixed amounts and
+    percentages against the original base price, capped at the base.
+    """
     base = float(base_price)
     if not discounts:
         return base, 0.0
     threshold = [d for d in discounts if d["kind"] == "threshold"]
     service = [d for d in discounts if d["kind"] == "service"]
+    ordered = threshold + service
+
+    def value_type(d):
+        return d["value_type"] if "value_type" in d.keys() else "%"
+
     if mode == "summed":
-        percent = sum(float(d["percent"]) for d in discounts)
-        percent = min(percent, 100.0)
-        final = base * (1 - percent / 100)
+        percent = sum(min(max(float(d["percent"]), 0.0), 100.0) for d in ordered if value_type(d) == "%")
+        fixed = sum(max(float(d["percent"]), 0.0) for d in ordered if value_type(d) == "RUB")
+        discount_amount = min(base, base * min(percent, 100.0) / 100.0 + fixed)
+        final = base - discount_amount
     else:
         final = base
-        for d in threshold + service:
-            final *= (1 - min(max(float(d["percent"]), 0), 100) / 100)
+        for d in ordered:
+            value = max(float(d["percent"]), 0.0)
+            if value_type(d) == "RUB":
+                final -= value
+            else:
+                final *= (1 - min(value, 100.0) / 100.0)
+            final = max(final, 0.0)
+        discount_amount = base - final
     final = round(max(final, 0.0), 2)
     return final, round(base - final, 2)
 
-
 def discount_description(rows):
     return "\n".join(
-        f"#{row['id']} — {discount_kind_label(row)} — *{format_price(row['percent'])}%* — {discount_period_label(row)}"
+        f"#{row['id']} — {discount_kind_label(row)} — *{discount_value_label(row)}* — {discount_period_label(row)}"
         for row in rows
     )
 
@@ -527,7 +584,7 @@ async def show_manager_panel(update: Update, edit=False):
 def format_discount_choice(order_id, rows):
     lines = [f"🏷 *Для заказа №{order_id} доступны скидки:*", ""]
     for row in rows:
-        lines.append(f"• {discount_kind_label(row)} — *{format_price(row['percent'])}%*")
+        lines.append(f"• {discount_kind_label(row)} — *{discount_value_label(row)}*")
     lines += [
         "",
         "Выбери, как применить скидки:",
@@ -819,7 +876,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 ok = upload_github_backup()
                 if ok:
-                    await query.edit_message_text("✅ Бэкап orders.db загружен на GitHub.", reply_markup=manager_keyboard())
+                    await query.edit_message_text("✅ Бэкап БД и кода загружен на GitHub.", reply_markup=manager_keyboard())
                 else:
                     await query.edit_message_text("⚠️ GitHub-бэкап не настроен. Добавь переменные GITHUB_* в Railway.", reply_markup=manager_keyboard())
             except Exception as exc:
@@ -838,13 +895,27 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if data.startswith("mgr_discount_type:"):
             kind = data.split(":", 1)[1]
+            context.user_data["manager_discount_kind"] = kind
+            context.user_data["manager_discount_step"] = "value_type"
+            await query.edit_message_text(
+                "💵 *Как задать размер скидки?*",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💰 В рублях", callback_data="mgr_discount_value_type:RUB")],
+                    [InlineKeyboardButton("📉 В процентах", callback_data="mgr_discount_value_type:%")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="mgr_discount_add")],
+                ]),
+                parse_mode="Markdown"
+            )
+            return
+        if data.startswith("mgr_discount_value_type:"):
+            value_type = data.split(":", 1)[1]
+            kind = context.user_data.get("manager_discount_kind")
+            context.user_data["manager_discount_value_type"] = value_type
             if kind == "threshold":
                 context.user_data["manager_discount_step"] = "threshold"
-                context.user_data["manager_discount_kind"] = kind
                 await query.edit_message_text("💰 Введи минимальную сумму заказа в рублях, например `1000`.", parse_mode="Markdown")
             elif kind == "service":
                 context.user_data["manager_discount_step"] = "service"
-                context.user_data["manager_discount_kind"] = kind
                 await query.edit_message_text("🛒 Введи точное название услуги, например `Крутки` или `Диковинки`.")
             return
         if data.startswith("mgr_discount_period:"):
@@ -1223,12 +1294,13 @@ async def finalize_discount_creation(update: Update, context: ContextTypes.DEFAU
     threshold = float(context.user_data.get("manager_discount_threshold", 0))
     service = context.user_data.get("manager_discount_service", "")
     percent = float(context.user_data.get("manager_discount_percent", 0))
+    value_type = context.user_data.get("manager_discount_value_type", "%")
     expires_at = context.user_data.get("manager_discount_expires_at")
     conn = db()
     if delete_old:
         conn.execute("UPDATE discounts SET active=0 WHERE active=1")
-    conn.execute("INSERT INTO discounts (kind, threshold, service, percent, active, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
-                 (kind, threshold, service, percent, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expires_at))
+    conn.execute("INSERT INTO discounts (kind, threshold, service, percent, value_type, active, created_at, expires_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                 (kind, threshold, service, percent, value_type, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expires_at))
     conn.commit()
     conn.close()
     period = "без срока" if not expires_at else f"до {expires_at}"
@@ -1258,27 +1330,36 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Сумма должна быть больше 0.")
                 return
             context.user_data["manager_discount_threshold"] = threshold
-            context.user_data["manager_discount_step"] = "percent"
-            await update.message.reply_text("📉 Введи размер скидки в процентах, например `10`.", parse_mode="Markdown")
+            context.user_data["manager_discount_step"] = "value"
+            unit = "процентах" if context.user_data.get("manager_discount_value_type", "%") == "%" else "рублях"
+            example = "10" if unit == "процентах" else "100"
+            await update.message.reply_text(f"📉 Введи размер скидки в {unit}, например `{example}`.", parse_mode="Markdown")
             return
         if step == "service":
             if len(text) > 100:
                 await update.message.reply_text("❌ Слишком длинное название услуги.")
                 return
             context.user_data["manager_discount_service"] = text
-            context.user_data["manager_discount_step"] = "percent"
-            await update.message.reply_text("📉 Введи размер скидки в процентах, например `15`.", parse_mode="Markdown")
+            context.user_data["manager_discount_step"] = "value"
+            unit = "процентах" if context.user_data.get("manager_discount_value_type", "%") == "%" else "рублях"
+            example = "15" if unit == "процентах" else "100"
+            await update.message.reply_text(f"📉 Введи размер скидки в {unit}, например `{example}`.", parse_mode="Markdown")
             return
-        if step == "percent":
+        if step in ("percent", "value"):
+            value_type = context.user_data.get("manager_discount_value_type", "%")
             try:
-                percent = float(text.replace(",", "."))
+                value = float(text.replace(",", "."))
             except ValueError:
-                await update.message.reply_text("❌ Введи процент числом, например 10.")
+                unit = "процент" if value_type == "%" else "рублей"
+                await update.message.reply_text(f"❌ Введи размер скидки числом в {unit}, например 10.")
                 return
-            if percent <= 0 or percent > 100:
+            if value <= 0:
+                await update.message.reply_text("❌ Размер скидки должен быть больше 0.")
+                return
+            if value_type == "%" and value > 100:
                 await update.message.reply_text("❌ Процент должен быть от 0.01 до 100.")
                 return
-            context.user_data["manager_discount_percent"] = percent
+            context.user_data["manager_discount_percent"] = value
             context.user_data["manager_discount_step"] = "period"
             await update.message.reply_text(
                 "⏱ *Период действия скидки*\n\nВыбери срок:",
@@ -1570,7 +1651,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         ok = upload_github_backup()
         await update.message.reply_text(
-            "✅ Бэкап orders.db загружен на GitHub." if ok else "⚠️ GitHub-бэкап не настроен. Проверь GITHUB_* в Railway.",
+            "✅ Бэкап БД и кода загружен на GitHub." if ok else "⚠️ GitHub-бэкап не настроен. Проверь GITHUB_* в Railway.",
             reply_markup=manager_keyboard(),
         )
     except Exception as exc:
