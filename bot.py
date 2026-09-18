@@ -257,6 +257,7 @@ def db():
             threshold REAL DEFAULT 0,
             service TEXT DEFAULT '',
             percent REAL NOT NULL,
+            value_type TEXT NOT NULL DEFAULT 'percent',
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             expires_at TEXT DEFAULT NULL
@@ -265,6 +266,8 @@ def db():
     dcols = {row[1] for row in conn.execute("PRAGMA table_info(discounts)").fetchall()}
     if "expires_at" not in dcols:
         conn.execute("ALTER TABLE discounts ADD COLUMN expires_at TEXT DEFAULT NULL")
+    if "value_type" not in dcols:
+        conn.execute("ALTER TABLE discounts ADD COLUMN value_type TEXT NOT NULL DEFAULT 'percent'")
     conn.commit()
     return conn
 
@@ -455,8 +458,12 @@ def manager_keyboard():
 
 def discount_kind_label(row):
     if row["kind"] == "threshold":
-        return f"На заказ от {format_price(row['threshold'])} ₽"
-    return f"На услугу: {row['service']}"
+        base = f"На заказ от {format_price(row['threshold'])} ₽"
+    else:
+        base = f"На услугу: {row['service']}"
+    value_type = row["value_type"] if "value_type" in row.keys() else "percent"
+    value = format_price(row["percent"])
+    return f"{base} — {value} {'₽' if value_type == 'rubles' else '%'}"
 
 def discount_period_label(row):
     return "без срока" if not row["expires_at"] else f"до {row['expires_at']}"
@@ -485,27 +492,32 @@ def get_applicable_discounts(order):
 
 
 def calculate_discount(base_price, discounts, mode="sequential"):
-    """Calculate discount. sequential = general first, then service; summed = sum percentages."""
+    """Apply percentage and fixed-ruble discounts to the applicable base amount."""
     base = float(base_price)
     if not discounts:
         return base, 0.0
-    threshold = [d for d in discounts if d["kind"] == "threshold"]
-    service = [d for d in discounts if d["kind"] == "service"]
-    if mode == "summed":
-        percent = sum(float(d["percent"]) for d in discounts)
-        percent = min(percent, 100.0)
+
+    def apply_one(current, row):
+        value = max(float(row["percent"]), 0.0)
+        value_type = row["value_type"] if "value_type" in row.keys() else "percent"
+        if value_type == "rubles":
+            return max(current - value, 0.0)
+        return current * (1 - min(value, 100.0) / 100)
+
+    if mode == "summed" and all((d["value_type"] if "value_type" in d.keys() else "percent") == "percent" for d in discounts):
+        percent = min(sum(float(d["percent"]) for d in discounts), 100.0)
         final = base * (1 - percent / 100)
     else:
         final = base
-        for d in threshold + service:
-            final *= (1 - min(max(float(d["percent"]), 0), 100) / 100)
+        for d in discounts:
+            final = apply_one(final, d)
     final = round(max(final, 0.0), 2)
     return final, round(base - final, 2)
 
 
 def discount_description(rows):
     return "\n".join(
-        f"#{row['id']} — {discount_kind_label(row)} — *{format_price(row['percent'])}%* — {discount_period_label(row)}"
+        f"#{row['id']} — {discount_kind_label(row)} — {discount_period_label(row)}"
         for row in rows
     )
 
@@ -527,7 +539,7 @@ async def show_manager_panel(update: Update, edit=False):
 def format_discount_choice(order_id, rows):
     lines = [f"🏷 *Для заказа №{order_id} доступны скидки:*", ""]
     for row in rows:
-        lines.append(f"• {discount_kind_label(row)} — *{format_price(row['percent'])}%*")
+        lines.append(f"• {discount_kind_label(row)}")
     lines += [
         "",
         "Выбери, как применить скидки:",
@@ -815,14 +827,25 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if data.startswith("mgr_discount_type:"):
             kind = data.split(":", 1)[1]
+            if kind not in ("threshold", "service"):
+                return
+            context.user_data["manager_discount_kind"] = kind
+            context.user_data["manager_discount_step"] = "threshold" if kind == "threshold" else "service"
             if kind == "threshold":
-                context.user_data["manager_discount_step"] = "threshold"
-                context.user_data["manager_discount_kind"] = kind
                 await query.edit_message_text("💰 Введи минимальную сумму заказа в рублях, например `1000`.", parse_mode="Markdown")
-            elif kind == "service":
-                context.user_data["manager_discount_step"] = "service"
-                context.user_data["manager_discount_kind"] = kind
+            else:
                 await query.edit_message_text("🛒 Введи точное название услуги, например `Крутки` или `Диковинки`.")
+            return
+        if data.startswith("mgr_discount_value_type:"):
+            value_type = data.split(":", 1)[1]
+            if value_type not in ("rubles", "percent"):
+                return
+            context.user_data["manager_discount_value_type"] = value_type
+            context.user_data["manager_discount_step"] = "percent"
+            if value_type == "rubles":
+                await query.edit_message_text("💰 Введи размер скидки в рублях, например `300`.")
+            else:
+                await query.edit_message_text("📊 Введи размер скидки в процентах, например `10`.")
             return
         if data.startswith("mgr_discount_period:"):
             choice = data.split(":", 1)[1]
@@ -1179,12 +1202,13 @@ async def finalize_discount_creation(update: Update, context: ContextTypes.DEFAU
     threshold = float(context.user_data.get("manager_discount_threshold", 0))
     service = context.user_data.get("manager_discount_service", "")
     percent = float(context.user_data.get("manager_discount_percent", 0))
+    value_type = context.user_data.get("manager_discount_value_type", "percent")
     expires_at = context.user_data.get("manager_discount_expires_at")
     conn = db()
     if delete_old:
         conn.execute("UPDATE discounts SET active=0 WHERE active=1")
-    conn.execute("INSERT INTO discounts (kind, threshold, service, percent, active, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
-                 (kind, threshold, service, percent, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expires_at))
+    conn.execute("INSERT INTO discounts (kind, threshold, service, percent, value_type, active, created_at, expires_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                 (kind, threshold, service, percent, value_type, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expires_at))
     conn.commit()
     conn.close()
     period = "без срока" if not expires_at else f"до {expires_at}"
@@ -1214,27 +1238,43 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Сумма должна быть больше 0.")
                 return
             context.user_data["manager_discount_threshold"] = threshold
-            context.user_data["manager_discount_step"] = "percent"
-            await update.message.reply_text("📉 Введи размер скидки в процентах, например `10`.", parse_mode="Markdown")
+            context.user_data["manager_discount_step"] = "value_type"
+            await update.message.reply_text(
+                "📉 Выбери, как задать скидку:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💰 Фиксированная сумма ₽", callback_data="mgr_discount_value_type:rubles")],
+                    [InlineKeyboardButton("📊 Процент от суммы заказа", callback_data="mgr_discount_value_type:percent")],
+                ])
+            )
             return
         if step == "service":
             if len(text) > 100:
                 await update.message.reply_text("❌ Слишком длинное название услуги.")
                 return
             context.user_data["manager_discount_service"] = text
-            context.user_data["manager_discount_step"] = "percent"
-            await update.message.reply_text("📉 Введи размер скидки в процентах, например `15`.", parse_mode="Markdown")
+            context.user_data["manager_discount_step"] = "value_type"
+            await update.message.reply_text(
+                "📉 Выбери, как задать скидку:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💰 Фиксированная сумма ₽", callback_data="mgr_discount_value_type:rubles")],
+                    [InlineKeyboardButton("📊 Процент от стоимости услуги", callback_data="mgr_discount_value_type:percent")],
+                ])
+            )
             return
         if step == "percent":
             try:
-                percent = float(text.replace(",", "."))
+                value = float(text.replace(",", "."))
             except ValueError:
-                await update.message.reply_text("❌ Введи процент числом, например 10.")
+                await update.message.reply_text("❌ Введи число, например `10`.", parse_mode="Markdown")
                 return
-            if percent <= 0 or percent > 100:
-                await update.message.reply_text("❌ Процент должен быть от 0.01 до 100.")
+            value_type = context.user_data.get("manager_discount_value_type", "percent")
+            if value <= 0:
+                await update.message.reply_text("❌ Размер скидки должен быть больше 0.")
                 return
-            context.user_data["manager_discount_percent"] = percent
+            if value_type == "percent" and value > 100:
+                await update.message.reply_text("❌ Процент скидки должен быть от 0.01 до 100.")
+                return
+            context.user_data["manager_discount_percent"] = value
             context.user_data["manager_discount_step"] = "period"
             await update.message.reply_text(
                 "⏱ *Период действия скидки*\n\nВыбери срок:",
