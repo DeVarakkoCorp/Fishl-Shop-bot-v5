@@ -6,3 +6,8 @@ venv/
 
 # Railway persistent runtime data
 data/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
