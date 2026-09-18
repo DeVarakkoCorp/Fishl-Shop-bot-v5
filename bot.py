@@ -134,6 +134,13 @@ def upload_github_backup():
     return True
 
 
+
+def region_tp_quantity_keyboard(order_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{q} ТП", callback_data=f"region_tp_qty:{order_id}:{q}")]
+        for q in REGION_TP_QUANTITY_OPTIONS
+    ])
+
 async def scheduled_github_backup(context: ContextTypes.DEFAULT_TYPE):
     try:
         upload_github_backup()
@@ -181,6 +188,14 @@ RANK57_PRICES = {
     "Театр": "Театр🌟\n\nОбычная сложность (3 этапа) — 200₽🤩\nСредняя сложность (6 этапов) — 350₽🤩\nСложная сложность (9 этапов) — 450₽🤩🤩\nАрканы — 1000₽🤩",
 }
 RANK57_CATEGORIES = list(RANK57_PRICES.keys())
+
+# TP quantity options for regional cleanup.
+REGION_TP_QUANTITY_OPTIONS = [1, 5, 10, 20, 50, 100]
+
+def region_tp_price(base_price, quantity):
+    """Price regional TP cleanup proportionally to the selected TP quantity."""
+    return round(float(base_price) * quantity / 100)
+
 STATUS_LABELS = {"new": "🆕 Новый", "taken": "🟡 Взято", "working": "🔵 В работе", "done": "✅ Выполнен", "cancelled": "❌ Отменён"}
 
 # Доступ к панели менеджера только для этих Telegram-юзернеймов.
@@ -523,6 +538,7 @@ def format_discount_choice(order_id, rows):
 
 
 def format_admin_order(row):
+    row = dict(row)
     status = STATUS_LABELS.get(row["status"], row["status"])
     manager = f"\n👨‍💼 Менеджер: {row['manager_name']}" if row["manager_name"] else ""
     return (
@@ -1121,6 +1137,35 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ Отправляй только данные от аккаунта, который используется для заказа.",
             parse_mode="Markdown"
         )
+
+    if data.startswith("region_tp_qty:"):
+        try:
+            _, order_id_s, qty_s = data.split(":", 2)
+            order_id = int(order_id_s)
+            quantity = int(qty_s)
+        except (ValueError, TypeError):
+            await query.answer("Некорректное количество ТП.", show_alert=True)
+            return
+
+        order = orders.get(update.effective_user.id)
+        if not order or order.get("id") != order_id:
+            await query.answer("Заказ не найден. Начните оформление заново.", show_alert=True)
+            return
+
+        base_price = float(order.get("price", 0))
+        # Existing regional tier prices are for 100% completion.
+        order["quantity"] = quantity
+        order["price"] = region_tp_price(base_price, quantity)
+
+        await query.answer()
+        await query.edit_message_text(
+            f"Вы выбрали **{quantity} ТП**.\n"
+            f"Стоимость: **{format_price(order['price'])} ₽**\n\n"
+            "Теперь продолжайте оформление заказа.",
+            parse_mode="Markdown",
+        )
+        return
+
         return
 
 
