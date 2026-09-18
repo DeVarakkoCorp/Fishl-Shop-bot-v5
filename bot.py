@@ -994,15 +994,20 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "contact":
-        usernames = sorted(MANAGER_USERNAMES)
         buttons = [
-            [InlineKeyboardButton(f"💬 @{username}", url=f"https://t.me/{username}")]
-            for username in usernames
+            [InlineKeyboardButton("💬 @fishlme — менеджер", url="https://t.me/fishlme")],
+            [InlineKeyboardButton("💬 @devarapq — разработчик", url="https://t.me/devarapq")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
         ]
-        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
-        names = "\n".join(f"• @{username}" for username in usernames)
+        text = (
+            "📞 *Связь*\n\n"
+            "💬 *@fishlme — менеджер*\n"
+            "Основной контакт для связи по заказам и вопросам.\n\n"
+            "🛠 *@devarapq — разработчик*\n"
+            "Связь с разработчиком только если менеджер не отвечает в течение нескольких часов."
+        )
         await query.edit_message_text(
-            f"📞 *Связь с менеджерами*\n\n{names}",
+            text,
             reply_markup=InlineKeyboardMarkup(buttons),
             parse_mode="Markdown"
         )
@@ -1465,7 +1470,24 @@ async def my_orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def manager_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_manager_panel(update, context, edit=False)
+    """Открывает панель менеджера по команде /manager.
+
+    Отдельная реализация здесь нужна, чтобы команда не зависела от
+    callback-логики кнопок панели.
+    """
+    if not is_manager(update):
+        await update.message.reply_text("❌ Доступ запрещён.")
+        return
+
+    try:
+        await update.message.reply_text(
+            "👨‍💼 *Панель менеджера*\n\nВыбери действие:",
+            reply_markup=manager_keyboard(),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Failed to open manager panel via /manager")
+        await update.message.reply_text("❌ Не удалось открыть панель менеджера. Проверь логи Railway.")
 
 
 async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
