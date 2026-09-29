@@ -303,8 +303,111 @@ def db():
         conn.execute("ALTER TABLE discounts ADD COLUMN value_type TEXT NOT NULL DEFAULT '%'")
     if "expires_at" not in dcols:
         conn.execute("ALTER TABLE discounts ADD COLUMN expires_at TEXT DEFAULT NULL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS service_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            active INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS service_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            price REAL NOT NULL DEFAULT 0,
+            quantity_mode TEXT NOT NULL DEFAULT 'fixed',
+            unit TEXT NOT NULL DEFAULT 'шт.',
+            active INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(category_id) REFERENCES service_categories(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS region_price_overrides (
+            region TEXT PRIMARY KEY,
+            price_0_100 REAL NOT NULL,
+            price_50_100 REAL NOT NULL,
+            price_80_100 REAL NOT NULL
+        )
+    """)
+    conn.commit()
+    seed_dynamic_services(conn)
+    # Fix the old teleport placeholder in case the dynamic table already existed.
+    conn.execute("UPDATE service_items SET name='Тп в любые доп. локации (1шт)' WHERE name LIKE '%Тп в ???%'")
     conn.commit()
     return conn
+
+
+def seed_dynamic_services(conn):
+    existing = conn.execute("SELECT COUNT(*) FROM service_categories").fetchone()[0]
+    if existing:
+        return
+    for cat_index, category in enumerate(PRICE_CATEGORIES):
+        cur = conn.execute("INSERT INTO service_categories(name,active,sort_order) VALUES (?,1,?)", (category, cat_index))
+        category_id = cur.lastrowid
+        if category == "Крутки":
+            items = [("1 крутка",24,"fixed","крутка"),("10 круток",240,"fixed","комплект"),("100 круток",2400,"fixed","комплект"),("Своя количество",24,"quantity","крутка")]
+        elif category == "Диковинки":
+            items = [(region,price,"quantity","шт.") for region,price in DIKOVINKI_PRICES.items()]
+        elif category == "Окулы":
+            items = [(name,price,"quantity","шт.") for name,price in OKULY_PRICES]
+        else:
+            items=[]
+            for line in [line.strip() for line in EXTRA_PRICES[category].split("\n") if line.strip()]:
+                if line.startswith("Уточняйте в лс") or line.startswith("(") or line in {"КРУТКИ","ЭНДГЕЙМ","НАТИСК","Театр🌟"}:
+                    continue
+                match=re.search(r"(\d+(?:\.5)?)\s*(?:₽|руб(?:лей|ля)?|рубл(?:ей|я)?)",line,re.I)
+                if not match: continue
+                name=line
+                if category == "Телепорты":
+                    name=re.sub(r"Тп в \?\?\?","Тп в любые доп. локации",name,flags=re.I)
+                    mode,unit="quantity","ТП"
+                else:
+                    mode,unit="fixed","шт."
+                items.append((name,float(match.group(1)),mode,unit))
+        for item_index,(name,price,mode,unit) in enumerate(items):
+            conn.execute("INSERT INTO service_items(category_id,name,price,quantity_mode,unit,active,sort_order) VALUES (?,?,?,?,?,1,?)",(category_id,name,price,mode,unit,item_index))
+    for region,values in PRICES.items():
+        conn.execute("INSERT OR IGNORE INTO region_price_overrides(region,price_0_100,price_50_100,price_80_100) VALUES (?,?,?,?)",(region,values["0-100"],values["50-100"],values["80-100"]))
+
+
+def get_service_categories(active_only=True):
+    conn=db(); where="WHERE active=1" if active_only else ""
+    rows=conn.execute(f"SELECT * FROM service_categories {where} ORDER BY sort_order,id").fetchall(); conn.close(); return rows
+
+
+def get_service_category(category_id):
+    conn=db(); row=conn.execute("SELECT * FROM service_categories WHERE id=?",(category_id,)).fetchone(); conn.close(); return row
+
+
+def get_service_items(category_id, active_only=True):
+    conn=db(); where="AND active=1" if active_only else ""
+    rows=conn.execute(f"SELECT * FROM service_items WHERE category_id=? {where} ORDER BY sort_order,id",(category_id,)).fetchall(); conn.close(); return rows
+
+
+def get_service_item(item_id):
+    conn=db(); row=conn.execute("SELECT si.*, sc.name AS category_name FROM service_items si JOIN service_categories sc ON sc.id=si.category_id WHERE si.id=?",(item_id,)).fetchone(); conn.close(); return row
+
+
+def get_region_prices(region):
+    conn=db(); row=conn.execute("SELECT * FROM region_price_overrides WHERE region=?",(region,)).fetchone(); conn.close()
+    if row:
+        return {"0-100":row["price_0_100"],"50-100":row["price_50_100"],"80-100":row["price_80_100"]}
+    return PRICES[region]
+
+
+def service_category_text(category_id):
+    category=get_service_category(category_id); items=get_service_items(category_id)
+    if not category: return ""
+    lines=[category["name"]]
+    for item in items:
+        if category["name"] == "Крутки" and item["quantity_mode"] == "quantity":
+            continue
+        if item["quantity_mode"]=="quantity": lines.append(f"{item['name']} — {format_price(item['price'])} ₽/{item['unit']}")
+        else: lines.append(f"{item['name']} — {format_price(item['price'])} ₽")
+    return "\n".join(lines)
 
 
 def region_keyboard(callback_prefix="region"):
@@ -314,7 +417,7 @@ def region_keyboard(callback_prefix="region"):
 
 
 def tier_keyboard(region):
-    prices = PRICES[region]
+    prices = get_region_prices(region)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"0–100% — {prices['0-100']} ₽", callback_data=f"tier:{region}:0")],
         [InlineKeyboardButton(f"50–100% — {prices['50-100']} ₽", callback_data=f"tier:{region}:1")],
@@ -324,24 +427,9 @@ def tier_keyboard(region):
 
 
 def service_category_keyboard():
-    """Сохраняет старую структуру меню услуг.
-
-    Кнопка «Для 57+ рангов» открывает отдельный список из четырёх разделов.
-    """
-    rows = [
-        [InlineKeyboardButton("🧹 Зачистка по регионам", callback_data="cleanup_regions")],
-        [InlineKeyboardButton("Крутки", callback_data="service_category:0")],
-        [InlineKeyboardButton("Задания легенд", callback_data="service_category:1")],
-        [InlineKeyboardButton("Сюжет (одна глава)", callback_data="service_category:2")],
-        [InlineKeyboardButton("Задания", callback_data="service_category:3")],
-        [InlineKeyboardButton("Священный призыв семерых", callback_data="service_category:4")],
-        [InlineKeyboardButton("Телепорты", callback_data="service_category:5")],
-        [InlineKeyboardButton("Окулы", callback_data="service_category:6")],
-        [InlineKeyboardButton("Эхо", callback_data="service_category:7")],
-        [InlineKeyboardButton("Диковинки", callback_data="service_category:8")],
-        [InlineKeyboardButton("Для 57+ рангов", callback_data="service_57")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-    ]
+    rows=[[InlineKeyboardButton(c["name"],callback_data=f"service_category_db:{c['id']}")] for c in get_service_categories()]
+    rows.append([InlineKeyboardButton("Для 57+ рангов",callback_data="service_57")])
+    rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="back")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -385,57 +473,25 @@ def rank57_item_data(category_index, item_index):
     return category, line, price
 
 
-def service_item_keyboard(category_index):
-    category = PRICE_CATEGORIES[category_index]
-
-    if category == "Крутки":
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("1 крутка — 24 ₽", callback_data="service_item:0:1")],
-            [InlineKeyboardButton("10 круток — 240 ₽", callback_data="service_item:0:2")],
-            [InlineKeyboardButton("100 круток — 2400 ₽", callback_data="service_item:0:3")],
-            [InlineKeyboardButton("✏️ Ввести своё количество", callback_data="custom_quantity:spins:old")],
-            [InlineKeyboardButton("⬅️ К услугам", callback_data="cleanup")],
-        ])
-
-    if category == "Диковинки":
-        rows = [[InlineKeyboardButton(region, callback_data=f"custom_quantity:dikovinki:{i}")]
-                for i, region in enumerate(DIKOVINKI_PRICES)]
-        rows.append([InlineKeyboardButton("⬅️ К услугам", callback_data="cleanup")])
-        return InlineKeyboardMarkup(rows)
-
-    if category == "Окулы":
-        rows = [[InlineKeyboardButton(f"{name} — {price} ₽/шт.", callback_data=f"custom_quantity:okuly:{i}")]
-                for i, (name, price) in enumerate(OKULY_PRICES)]
-        rows.append([InlineKeyboardButton("⬅️ К услугам", callback_data="cleanup")])
-        return InlineKeyboardMarkup(rows)
-
-    lines = [line.strip() for line in EXTRA_PRICES[category].split("\n") if line.strip()]
-    rows = []
-    for i, line in enumerate(lines):
-        if line.startswith("Уточняйте в лс") or line.startswith("(Дочистку"):
+def service_item_keyboard(category_id):
+    category=get_service_category(category_id)
+    if not category: return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К услугам",callback_data="cleanup")]])
+    items=get_service_items(category_id); rows=[]
+    for item in items:
+        if category["name"] == "Крутки" and item["quantity_mode"] == "quantity":
             continue
-        if line in {"КРУТКИ", "ЭНДГЕЙМ", "НАТИСК", "Театр🌟"}:
-            continue
-        rows.append([InlineKeyboardButton(line[:60], callback_data=f"service_item:{category_index}:{i}")])
-    rows.append([InlineKeyboardButton("⬅️ К услугам", callback_data="cleanup")])
+        suffix=f" ₽/{item['unit']}" if item["quantity_mode"]=="quantity" else " ₽"
+        rows.append([InlineKeyboardButton(f"{item['name']} — {format_price(item['price'])}{suffix}",callback_data=f"service_item_db:{item['id']}")])
+    if category["name"] == "Крутки":
+        custom=next((i for i in items if i["quantity_mode"]=="quantity"),None)
+        if custom: rows.append([InlineKeyboardButton("✏️ Ввести своё количество",callback_data=f"service_item_custom:{custom['id']}")])
+    rows.append([InlineKeyboardButton("⬅️ К услугам",callback_data="cleanup")])
     return InlineKeyboardMarkup(rows)
 
 
-def service_item_data(category_index, item_index):
-    category = PRICE_CATEGORIES[category_index]
-    lines = [line.strip() for line in EXTRA_PRICES[category].split("\n") if line.strip()]
-    if item_index < 0 or item_index >= len(lines):
-        return None
-    line = lines[item_index]
-    # The source uses a few non-orderable explanatory lines.
-    if line.startswith("Уточняйте в лс") or line.startswith("(") or line in {"КРУТКИ", "ЭНДГЕЙМ", "НАТИСК", "Театр🌟"}:
-        return None
-    import re
-    match = re.search(r"(\d+(?:\.5)?)\s*(?:₽|руб(?:лей|ля)?|рубл(?:ей|я)?)", line, re.I)
-    if not match:
-        return None
-    price = int(float(match.group(1)))
-    return category, line, price
+def service_item_data_db(item_id):
+    row=get_service_item(item_id)
+    return row if row and row["active"] else None
 
 
 def cleanup_region_keyboard():
@@ -443,21 +499,11 @@ def cleanup_region_keyboard():
 
 
 def price_region_keyboard():
-    """Старое меню прайсов; «Для 57+ рангов» открывает четыре раздела."""
-    rows = [
-        [InlineKeyboardButton("🧹 Зачистка по регионам", callback_data="price_cleanup")],
-        [InlineKeyboardButton("Крутки", callback_data="price_category:0")],
-        [InlineKeyboardButton("Задания легенд", callback_data="price_category:1")],
-        [InlineKeyboardButton("Сюжет (одна глава)", callback_data="price_category:2")],
-        [InlineKeyboardButton("Задания", callback_data="price_category:3")],
-        [InlineKeyboardButton("Священный призыв семерых", callback_data="price_category:4")],
-        [InlineKeyboardButton("Телепорты", callback_data="price_category:5")],
-        [InlineKeyboardButton("Окулы", callback_data="price_category:6")],
-        [InlineKeyboardButton("Эхо", callback_data="price_category:7")],
-        [InlineKeyboardButton("Диковинки", callback_data="price_category:8")],
-        [InlineKeyboardButton("Для 57+ рангов", callback_data="price_57")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
-    ]
+    rows=[[InlineKeyboardButton("🧹 Зачистка по регионам",callback_data="price_cleanup")]]
+    for category in get_service_categories():
+        rows.append([InlineKeyboardButton(category["name"],callback_data=f"price_category_db:{category['id']}")])
+    rows.append([InlineKeyboardButton("Для 57+ рангов",callback_data="price_57")])
+    rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="back")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -487,6 +533,7 @@ def manager_keyboard():
         [InlineKeyboardButton("➕ Добавить скидку", callback_data="mgr_discount_add")],
         [InlineKeyboardButton("📋 Активные скидки", callback_data="mgr_discount_list")],
         [InlineKeyboardButton("🗑 Управление скидками", callback_data="mgr_discount_manage")],
+        [InlineKeyboardButton("🛠 Услуги и цены", callback_data="mgr_services")],
         [InlineKeyboardButton("💾 Сделать бэкап", callback_data="mgr_backup")],
     ])
 
@@ -854,14 +901,17 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "back":
         orders.pop(user_id, None)
         context.user_data.clear()
-        await query.edit_message_text(f"🎮 *{SHOP_NAME}*\n\nВыбери нужный раздел:", reply_markup=MAIN_MENU, parse_mode="Markdown")
+        if is_manager(update):
+            await show_manager_panel(update, context, edit=True)
+        else:
+            await query.edit_message_text(f"🎮 *{SHOP_NAME}*\n\nВыбери нужный раздел:", reply_markup=MAIN_MENU, parse_mode="Markdown")
         return
 
     if data.startswith("mgr_"):
         if not is_manager(update):
             await query.answer("Недоступно", show_alert=True)
             return
-        if data == "mgr_panel":
+        if data in {"mgr_panel", "mgr_back"}:
             await show_manager_panel(update, context, edit=True)
             return
         if data == "mgr_all_orders":
@@ -883,6 +933,70 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.exception("Manual GitHub backup failed")
                 await query.edit_message_text(f"❌ Не удалось сделать бэкап: {exc}", reply_markup=manager_keyboard())
             return
+        if data == "mgr_services":
+            await query.edit_message_text("🛠 *Услуги и цены*\n\nДобавляй новые услуги и меняй цены прямо из бота.",reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Добавить услугу",callback_data="mgr_service_add")],
+                [InlineKeyboardButton("➕ Добавить вариант",callback_data="mgr_service_item_add")],
+                [InlineKeyboardButton("✏️ Изменить цену услуги",callback_data="mgr_service_edit")],
+                [InlineKeyboardButton("🧹 Изменить цены зачистки",callback_data="mgr_region_edit")],
+                [InlineKeyboardButton("📋 Список услуг",callback_data="mgr_service_list")],
+                [InlineKeyboardButton("🏠 Панель менеджера",callback_data="mgr_panel")]],parse_mode="Markdown")); return
+        if data == "mgr_service_list":
+            lines=["🛠 *Услуги и цены*",""]
+            for cat in get_service_categories():
+                lines.append(f"*{cat['name']}*")
+                for item in get_service_items(cat["id"]):
+                    suffix=f"/{item['unit']}" if item["quantity_mode"]=="quantity" else ""
+                    lines.append(f"• {item['name']} — {format_price(item['price'])} ₽{suffix}")
+                lines.append("")
+            await query.edit_message_text("\n".join(lines)[:4000],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Услуги и цены",callback_data="mgr_services")]]),parse_mode="Markdown"); return
+        if data == "mgr_service_add":
+            context.user_data.clear(); context.user_data["manager_service_step"]="name"
+            await query.edit_message_text("➕ *Новая услуга*\n\nВведи название новой услуги:",parse_mode="Markdown"); return
+        if data == "mgr_service_item_add":
+            buttons=[[InlineKeyboardButton(c["name"],callback_data=f"mgr_service_item_category:{c['id']}")] for c in get_service_categories()]; buttons.append([InlineKeyboardButton("⬅️ Услуги и цены",callback_data="mgr_services")])
+            await query.edit_message_text("➕ *Новый вариант*\n\nВыбери существующую услугу:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
+        if data.startswith("mgr_service_item_category:"):
+            try: category_id=int(data.split(":",1)[1])
+            except ValueError: category_id=0
+            cat=get_service_category(category_id)
+            if not cat: await query.answer("Услуга не найдена",show_alert=True); return
+            context.user_data.clear(); context.user_data.update(manager_service_step="item_name",manager_service_category_id=category_id)
+            await query.edit_message_text(f"➕ *{cat['name']}*\n\nВведи название нового варианта:",parse_mode="Markdown"); return
+        if data == "mgr_service_edit":
+            buttons=[[InlineKeyboardButton(c["name"],callback_data=f"mgr_service_edit_category:{c['id']}")] for c in get_service_categories()]; buttons.append([InlineKeyboardButton("⬅️ Услуги и цены",callback_data="mgr_services")])
+            await query.edit_message_text("✏️ *Изменение цены*\n\nВыбери услугу:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
+        if data.startswith("mgr_service_edit_category:"):
+            try: category_id=int(data.split(":",1)[1])
+            except ValueError: category_id=0
+            cat=get_service_category(category_id)
+            if not cat: await query.answer("Услуга не найдена",show_alert=True); return
+            buttons=[[InlineKeyboardButton(f"{i['name']} — {format_price(i['price'])} ₽",callback_data=f"mgr_service_price:{i['id']}")] for i in get_service_items(category_id)]; buttons.append([InlineKeyboardButton("⬅️ Услуги и цены",callback_data="mgr_services")])
+            await query.edit_message_text(f"✏️ *{cat['name']}*\n\nВыбери пункт:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
+        if data.startswith("mgr_service_price:"):
+            try: item_id=int(data.split(":",1)[1])
+            except ValueError: item_id=0
+            item=get_service_item(item_id)
+            if not item: await query.answer("Пункт не найден",show_alert=True); return
+            context.user_data.clear(); context.user_data.update(manager_service_step="price",manager_service_item_id=item_id)
+            await query.edit_message_text(f"✏️ *{item['name']}*\n\nТекущая цена: *{format_price(item['price'])} ₽*\n\nВведи новую цену:",parse_mode="Markdown"); return
+        if data == "mgr_region_edit":
+            buttons=[[InlineKeyboardButton(r,callback_data=f"mgr_region:{r}")] for r in PRICES]; buttons.append([InlineKeyboardButton("⬅️ Услуги и цены",callback_data="mgr_services")])
+            await query.edit_message_text("🧹 *Изменение цен зачистки*\n\nВыбери регион:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
+        if data.startswith("mgr_region:"):
+            region=data.split(":",1)[1]
+            if region not in PRICES: await query.answer("Регион не найден",show_alert=True); return
+            prices=get_region_prices(region)
+            buttons=[[InlineKeyboardButton(f"0–100% — {format_price(prices['0-100'])} ₽",callback_data=f"mgr_region_price:{region}:0-100")],[InlineKeyboardButton(f"50–100% — {format_price(prices['50-100'])} ₽",callback_data=f"mgr_region_price:{region}:50-100")],[InlineKeyboardButton(f"80–100% — {format_price(prices['80-100'])} ₽",callback_data=f"mgr_region_price:{region}:80-100")],[InlineKeyboardButton("⬅️ Цены зачистки",callback_data="mgr_region_edit")]]
+            await query.edit_message_text(f"🧹 *{region}*\n\nВыбери цену:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
+        if data.startswith("mgr_region_price:"):
+            parts=data.split(":",2)
+            if len(parts)!=3: return
+            region,tier=parts[1],parts[2]
+            if region not in PRICES or tier not in TIER_KEYS: await query.answer("Некорректная цена",show_alert=True); return
+            context.user_data.clear(); context.user_data.update(manager_service_step="region_price",manager_region=region,manager_tier=tier)
+            await query.edit_message_text(f"✏️ *{region} — {tier}*\n\nТекущая цена: *{format_price(get_region_prices(region)[tier])} ₽*\n\nВведи новую цену:",parse_mode="Markdown"); return
+
         if data == "mgr_discount_add":
             context.user_data["manager_discount_step"] = "type"
             await query.edit_message_text(
@@ -997,13 +1111,24 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if region not in PRICES:
             await query.edit_message_text("❌ Регион не найден.", reply_markup=MAIN_MENU)
             return
-        prices = PRICES[region]
+        prices = get_region_prices(region)
         text = (f"💰 *{region}*\n\n"
                 f"0–100% — *{prices['0-100']} ₽*\n"
                 f"50–100% — *{prices['50-100']} ₽*\n"
                 f"80–100% — *{prices['80-100']} ₽*")
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К зачистке", callback_data="price_cleanup")], [InlineKeyboardButton("🏠 Главное меню", callback_data="back")]])
         await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+        return
+
+    if data.startswith("price_category_db:"):
+        try:
+            category_id=int(data.split(":",1)[1])
+        except ValueError:
+            category_id=0
+        category=get_service_category(category_id)
+        if not category:
+            await query.edit_message_text("❌ Раздел не найден.",reply_markup=price_region_keyboard()); return
+        await query.edit_message_text(f"💰 *{category['name']}*\n\n{service_category_text(category_id)}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К прайсам",callback_data="prices")],[InlineKeyboardButton("🏠 Главное меню",callback_data="back")]]),parse_mode="Markdown")
         return
 
     if data.startswith("price_category:"):
@@ -1119,113 +1244,93 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🧹 *Зачистка по регионам*\n\nВыбери регион:", reply_markup=region_keyboard(), parse_mode="Markdown")
         return
 
+    if data.startswith("service_category_db:"):
+        try:
+            category_id=int(data.split(":",1)[1])
+        except ValueError:
+            category_id=0
+        category=get_service_category(category_id)
+        if not category or not category["active"]:
+            await query.edit_message_text("❌ Услуга не найдена.",reply_markup=service_category_keyboard())
+            return
+        await query.edit_message_text(f"🛒 *{category['name']}*\n\n{service_category_text(category_id)}\n\nВыбери вариант для заказа:",reply_markup=service_item_keyboard(category_id),parse_mode="Markdown")
+        return
+
     if data.startswith("service_category:"):
         try:
-            category_index = int(data.split(":", 1)[1])
-            category = PRICE_CATEGORIES[category_index]
-        except (ValueError, IndexError):
-            await query.edit_message_text("❌ Услуга не найдена.", reply_markup=MAIN_MENU)
+            category_name=PRICE_CATEGORIES[int(data.split(":",1)[1])]
+            category=next((c for c in get_service_categories() if c["name"]==category_name),None)
+        except (ValueError,IndexError):
+            category=None
+        if not category:
+            await query.edit_message_text("❌ Услуга не найдена.",reply_markup=MAIN_MENU)
             return
-        await query.edit_message_text(
-            f"🛒 *{category}*\n\n{EXTRA_PRICES[category]}\n\nВыбери вариант для заказа:",
-            reply_markup=service_item_keyboard(category_index),
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text(f"🛒 *{category['name']}*\n\n{service_category_text(category['id'])}\n\nВыбери вариант для заказа:",reply_markup=service_item_keyboard(category['id']),parse_mode="Markdown")
+        return
+
+    if data.startswith("service_item_custom:"):
+        try: item_id=int(data.split(":",1)[1])
+        except ValueError: item_id=0
+        item=get_service_item(item_id)
+        if not item or not item["active"]:
+            await query.edit_message_text("❌ Пункт услуги не найден.",reply_markup=service_category_keyboard()); return
+        orders[user_id]={"service":item["category_name"],"service_item":item["name"],"quantity_unit":item["unit"],"unit_price":float(item["price"])}
+        context.user_data.clear(); context.user_data["waiting_for_quantity"]=True
+        await query.edit_message_text(f"✏️ *{item['name']}*\n\nЦена: *{format_price(item['price'])} ₽ за 1 {item['unit']}*\n\nВведи нужное количество:",parse_mode="Markdown")
+        return
+
+    if data.startswith("service_item_db:"):
+        try: item_id=int(data.split(":",1)[1])
+        except ValueError: item_id=0
+        item=service_item_data_db(item_id)
+        if not item:
+            await query.edit_message_text("❌ Этот пункт услуги недоступен.",reply_markup=service_category_keyboard()); return
+        if item["quantity_mode"]=="quantity":
+            orders[user_id]={"service":item["category_name"],"service_item":item["name"],"quantity_unit":item["unit"],"unit_price":float(item["price"])}
+            context.user_data.clear(); context.user_data["waiting_for_quantity"]=True
+            await query.edit_message_text(f"✏️ *{item['name']}*\n\nЦена: *{format_price(item['price'])} ₽ за 1 {item['unit']}*\n\nВведи нужное количество:",parse_mode="Markdown")
+            return
+        orders[user_id]={"service":item["category_name"],"service_item":item["name"],"price":float(item["price"])}
+        context.user_data.clear(); context.user_data["waiting_for_login"]=True
+        await query.edit_message_text(f"🛒 *Заказ услуги*\n\n*{item['category_name']}*\n{item['name']}\n\n🔐 *Шаг 1 из 3*\n\nОтправь почту (email), привязанную к аккаунту.",parse_mode="Markdown")
         return
 
     if data.startswith("custom_quantity:"):
-        parts = data.split(":")
-        if len(parts) != 3:
-            await query.edit_message_text("❌ Ошибка выбора.", reply_markup=service_category_keyboard())
-            return
-        kind, value = parts[1], parts[2]
-
-        if kind == "spins":
-            unit_price = 30.0 if value == "57" else 24.0
-            order = {"service": "Крутки", "quantity_unit": "круток", "unit_price": unit_price}
-            prompt = (
-                f"✏️ *Крутки*\n\n"
-                f"Цена: *{format_price(unit_price)} ₽ за 1 крутку*.\n\n"
-                "Введи нужное количество круток:"
-            )
-        elif kind == "dikovinki":
-            try:
-                region = list(DIKOVINKI_PRICES.keys())[int(value)]
-            except (ValueError, IndexError):
-                await query.edit_message_text("❌ Регион не найден.", reply_markup=service_category_keyboard())
-                return
-            unit_price = DIKOVINKI_PRICES[region]
-            order = {"service": "Диковинки", "region": region, "quantity_unit": "шт.", "unit_price": unit_price}
-            prompt = (
-                f"✏️ *Диковинки — {region}*\n\n"
-                f"Цена: *{format_price(unit_price)} ₽ за 1 шт.*\n\n"
-                "Введи нужное количество:"
-            )
-        elif kind == "okuly":
-            try:
-                item_name, unit_price = OKULY_PRICES[int(value)]
-            except (ValueError, IndexError):
-                await query.edit_message_text("❌ Окулы не найдены.", reply_markup=service_category_keyboard())
-                return
-            order = {"service": "Окулы", "service_item": item_name, "quantity_unit": "шт.", "unit_price": unit_price}
-            prompt = (
-                f"✏️ *{item_name}*\n\n"
-                f"Цена: *{format_price(unit_price)} ₽ за 1 шт.*\n\n"
-                "Введи нужное количество:"
-            )
-        else:
-            await query.edit_message_text("❌ Неизвестный тип услуги.", reply_markup=service_category_keyboard())
-            return
-
-        orders[user_id] = order
-        context.user_data.clear()
-        context.user_data["waiting_for_quantity"] = True
-        await query.edit_message_text(prompt, parse_mode="Markdown")
-        return
+        # Compatibility with old inline keyboards.
+        parts=data.split(":")
+        if len(parts)!=3: return
+        kind,value=parts[1],parts[2]
+        if kind=="spins":
+            cat=next((c for c in get_service_categories() if c["name"]=="Крутки"),None); items=get_service_items(cat["id"]) if cat else []
+            unit_price=float(items[0]["price"]) if items else 24
+            order={"service":"Крутки","quantity_unit":"крутка","unit_price":unit_price}; prompt=f"✏️ *Крутки*\n\nЦена: *{format_price(unit_price)} ₽ за 1 крутку*.\n\nВведи нужное количество круток:"
+        elif kind=="dikovinki":
+            try: region=list(DIKOVINKI_PRICES.keys())[int(value)]
+            except (ValueError,IndexError): return
+            cat=next((c for c in get_service_categories() if c["name"]=="Диковинки"),None); item=next((i for i in get_service_items(cat["id"]) if i["name"]==region),None) if cat else None
+            unit_price=float(item["price"]) if item else DIKOVINKI_PRICES[region]
+            order={"service":"Диковинки","region":region,"quantity_unit":"шт.","unit_price":unit_price}; prompt=f"✏️ *Диковинки — {region}*\n\nЦена: *{format_price(unit_price)} ₽ за 1 шт.*\n\nВведи нужное количество:"
+        elif kind=="okuly":
+            try: item_name=OKULY_PRICES[int(value)][0]
+            except (ValueError,IndexError): return
+            cat=next((c for c in get_service_categories() if c["name"]=="Окулы"),None); item=next((i for i in get_service_items(cat["id"]) if i["name"]==item_name),None) if cat else None
+            unit_price=float(item["price"]) if item else OKULY_PRICES[int(value)][1]
+            order={"service":"Окулы","service_item":item_name,"quantity_unit":"шт.","unit_price":unit_price}; prompt=f"✏️ *{item_name}*\n\nЦена: *{format_price(unit_price)} ₽ за 1 шт.*\n\nВведи нужное количество:"
+        else: return
+        orders[user_id]=order; context.user_data.clear(); context.user_data["waiting_for_quantity"]=True
+        await query.edit_message_text(prompt,parse_mode="Markdown"); return
 
     if data.startswith("service_item:"):
         try:
-            _, category_index, item_index = data.split(":", 2)
-            category_index, item_index = int(category_index), int(item_index)
-            item = service_item_data(category_index, item_index)
-        except (ValueError, IndexError):
-            item = None
+            _,ci,ii=data.split(":",2); ci=int(ci); ii=int(ii); category_name=PRICE_CATEGORIES[ci]; category=next((c for c in get_service_categories() if c["name"]==category_name),None); items=get_service_items(category["id"]) if category else []; item=items[ii]
+        except (ValueError,IndexError,KeyError): item=None
         if not item:
-            await query.edit_message_text("❌ Этот пункт нельзя оформить автоматически. Свяжись с менеджером для уточнения.", reply_markup=service_category_keyboard())
-            return
-        category, item_name, price = item
-
-        # Для телепортов цена указана за 1 ТП. После выбора региона
-        # сначала запрашиваем нужное количество, а уже затем email.
-        if category == "Телепорты":
-            base_name = re.sub(r"\s*\(1\s*шт\)\s*", "", item_name, flags=re.I)
-            orders[user_id] = {
-                "service": category,
-                "service_item": base_name,
-                "quantity_unit": "ТП",
-                "unit_price": float(price),
-            }
-            context.user_data.clear()
-            context.user_data["waiting_for_quantity"] = True
-            await query.edit_message_text(
-                f"✏️ *{base_name}*\n\n"
-                f"Цена: *{format_price(price)} ₽ за 1 ТП*\n\n"
-                "Введи нужное количество ТП:",
-                parse_mode="Markdown"
-            )
-            return
-
-        orders[user_id] = {"service": category, "service_item": item_name, "price": price}
-        context.user_data.clear()
-        context.user_data["waiting_for_login"] = True
-        await query.edit_message_text(
-            f"🛒 *Заказ услуги*\n\n*{category}*\n{item_name}\n\n"
-            "🔐 *Шаг 1 из 3*\n\n"
-            "Отправь почту (email), привязанную к аккаунту.\n\n"
-            "⚠️ Отправляй только данные от аккаунта, который используется для заказа.",
-            parse_mode="Markdown"
-        )
-        return
+            await query.edit_message_text("❌ Пункт услуги не найден.",reply_markup=service_category_keyboard()); return
+        if item["quantity_mode"]=="quantity":
+            orders[user_id]={"service":item["category_name"],"service_item":item["name"],"quantity_unit":item["unit"],"unit_price":float(item["price"])}; context.user_data.clear(); context.user_data["waiting_for_quantity"]=True
+            await query.edit_message_text(f"✏️ *{item['name']}*\n\nЦена: *{format_price(item['price'])} ₽ за 1 {item['unit']}*\n\nВведи нужное количество:",parse_mode="Markdown"); return
+        orders[user_id]={"service":item["category_name"],"service_item":item["name"],"price":float(item["price"])}; context.user_data.clear(); context.user_data["waiting_for_login"]=True
+        await query.edit_message_text(f"🛒 *Заказ услуги*\n\n*{item['category_name']}*\n{item['name']}\n\n🔐 *Шаг 1 из 3*\n\nОтправь почту (email), привязанную к аккаунту.",parse_mode="Markdown"); return
 
     if data.startswith("region:"):
         region = data.split(":", 1)[1]
@@ -1246,7 +1351,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         region, tier_index = parts[1], int(parts[2])
         orders.setdefault(user_id, {})
-        orders[user_id].update(region=region, tier_index=tier_index, price=PRICES[region][TIER_KEYS[tier_index]])
+        orders[user_id].update(region=region, tier_index=tier_index, price=get_region_prices(region)[TIER_KEYS[tier_index]])
         orders[user_id].setdefault("service", "Зачистка по регионам")
         orders[user_id]["service_item"] = f"Зачистка {TIER_NAMES[tier_index]}"
         context.user_data.clear()
@@ -1317,6 +1422,45 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the three order data steps: email, password, Telegram username."""
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
+    if is_manager(update) and context.user_data.get("manager_service_step"):
+        step=context.user_data["manager_service_step"]
+        if step=="name":
+            if not text or len(text)>80: await update.message.reply_text("❌ Название должно содержать от 1 до 80 символов."); return
+            context.user_data["manager_service_name"]=text; context.user_data["manager_service_step"]="price"
+            await update.message.reply_text("💰 Введи цену первой услуги в рублях, например 150."); return
+        if step=="price":
+            try: value=float(text.replace(",","."))
+            except ValueError: await update.message.reply_text("❌ Введи цену числом."); return
+            if value<=0 or value>1_000_000: await update.message.reply_text("❌ Цена должна быть от 0 до 1 000 000 ₽."); return
+            item_id=context.user_data.get("manager_service_item_id")
+            conn=db()
+            if item_id:
+                conn.execute("UPDATE service_items SET price=? WHERE id=?",(value,item_id)); conn.commit(); conn.close(); context.user_data.clear(); await update.message.reply_text("✅ Цена изменена.",reply_markup=manager_keyboard()); return
+            name=context.user_data.get("manager_service_name")
+            if not name: conn.close(); context.user_data.clear(); await update.message.reply_text("❌ Не удалось определить услугу.",reply_markup=manager_keyboard()); return
+            sort_order=conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM service_categories").fetchone()[0]
+            cur=conn.execute("INSERT INTO service_categories(name,active,sort_order) VALUES (?,1,?)",(name,sort_order)); cid=cur.lastrowid
+            conn.execute("INSERT INTO service_items(category_id,name,price,quantity_mode,unit,active,sort_order) VALUES (?,?,?,'fixed','шт.',1,0)",(cid,name,value)); conn.commit(); conn.close(); context.user_data.clear()
+            await update.message.reply_text(f"✅ Услуга {name} добавлена с ценой {format_price(value)} ₽.",reply_markup=manager_keyboard()); return
+        if step=="item_name":
+            if not text or len(text)>100: await update.message.reply_text("❌ Название должно содержать от 1 до 100 символов."); return
+            context.user_data["manager_service_item_name"]=text; context.user_data["manager_service_step"]="item_price"; await update.message.reply_text("💰 Введи цену варианта в рублях:"); return
+        if step=="item_price":
+            try: value=float(text.replace(",","."))
+            except ValueError: await update.message.reply_text("❌ Введи цену числом."); return
+            if value<=0 or value>1_000_000: await update.message.reply_text("❌ Цена должна быть от 0 до 1 000 000 ₽."); return
+            cid=context.user_data.get("manager_service_category_id"); name=context.user_data.get("manager_service_item_name")
+            if not cid or not name: context.user_data.clear(); await update.message.reply_text("❌ Не удалось сохранить вариант.",reply_markup=manager_keyboard()); return
+            conn=db(); sort_order=conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM service_items WHERE category_id=?",(cid,)).fetchone()[0]
+            conn.execute("INSERT INTO service_items(category_id,name,price,quantity_mode,unit,active,sort_order) VALUES (?,?,?,'fixed','шт.',1,?)",(cid,name,value,sort_order)); conn.commit(); conn.close(); context.user_data.clear(); await update.message.reply_text("✅ Вариант добавлен.",reply_markup=manager_keyboard()); return
+        if step=="region_price":
+            try: value=float(text.replace(",","."))
+            except ValueError: await update.message.reply_text("❌ Введи цену числом."); return
+            if value<=0 or value>1_000_000: await update.message.reply_text("❌ Цена должна быть от 0 до 1 000 000 ₽."); return
+            region=context.user_data.get("manager_region"); tier=context.user_data.get("manager_tier")
+            if region not in PRICES or tier not in TIER_KEYS: context.user_data.clear(); await update.message.reply_text("❌ Регион или уровень не найден.",reply_markup=manager_keyboard()); return
+            columns={"0-100":"price_0_100","50-100":"price_50_100","80-100":"price_80_100"}; conn=db(); conn.execute(f"UPDATE region_price_overrides SET {columns[tier]}=? WHERE region=?",(value,region)); conn.commit(); conn.close(); context.user_data.clear(); await update.message.reply_text("✅ Цена зачистки изменена.",reply_markup=manager_keyboard()); return
+
     # Manager discount setup is independent of customer orders.
     if is_manager(update) and context.user_data.get("manager_discount_step"):
         step = context.user_data.get("manager_discount_step")
