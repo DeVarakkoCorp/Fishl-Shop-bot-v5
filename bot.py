@@ -892,6 +892,39 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🎮 *{SHOP_NAME}*\n\nВыбери нужный раздел:", reply_markup=MAIN_MENU, parse_mode="Markdown")
 
 
+async def manager_services_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открывает раздел «Услуги и цены» отдельным обработчиком.
+
+    Отдельный handler нужен, чтобы этот callback не зависел от общего
+    диспетчера кнопок и всегда обрабатывался при нажатии кнопки менеджера.
+    """
+    query = update.callback_query
+    await query.answer()
+    if not is_manager(update):
+        await query.answer("Недоступно", show_alert=True)
+        return
+    try:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Добавить услугу", callback_data="mgr_service_add")],
+            [InlineKeyboardButton("➕ Добавить вариант", callback_data="mgr_service_item_add")],
+            [InlineKeyboardButton("✏️ Изменить цену услуги", callback_data="mgr_service_edit")],
+            [InlineKeyboardButton("🧹 Изменить цены зачистки", callback_data="mgr_region_edit")],
+            [InlineKeyboardButton("📋 Список услуг", callback_data="mgr_service_list")],
+            [InlineKeyboardButton("🏠 Панель менеджера", callback_data="mgr_panel")],
+        ])
+        await query.edit_message_text(
+            "🛠 *Услуги и цены*\n\nДобавляй новые услуги и меняй цены прямо из бота.",
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Failed to open manager services menu")
+        await query.edit_message_text(
+            "❌ Не удалось открыть раздел «Услуги и цены». Проверь логи Railway.",
+            reply_markup=manager_keyboard(),
+        )
+
+
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1913,6 +1946,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cancel_order, pattern=r"^cancel_order$"))
     app.add_handler(CallbackQueryHandler(apply_order_discount_choice, pattern=r"^discount_(sum|seq):"))
     app.add_handler(CallbackQueryHandler(order_status, pattern=r"^order_status:"))
+    app.add_handler(CallbackQueryHandler(manager_services_callback, pattern=r"^mgr_services$"))
     app.add_handler(CallbackQueryHandler(button))
     # One text handler dispatches to the correct step. Two separate catch-all
     # handlers would both see the same message and could corrupt the flow.
