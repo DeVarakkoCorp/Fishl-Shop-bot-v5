@@ -902,7 +902,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         orders.pop(user_id, None)
         context.user_data.clear()
         if is_manager(update):
-            await show_manager_panel(update, context, edit=True)
+            await show_manager_panel(update, edit=True)
         else:
             await query.edit_message_text(f"🎮 *{SHOP_NAME}*\n\nВыбери нужный раздел:", reply_markup=MAIN_MENU, parse_mode="Markdown")
         return
@@ -912,7 +912,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Недоступно", show_alert=True)
             return
         if data in {"mgr_panel", "mgr_back"}:
-            await show_manager_panel(update, context, edit=True)
+            await show_manager_panel(update, edit=True)
             return
         if data == "mgr_all_orders":
             await show_manager_all_orders(update, context, edit=True)
