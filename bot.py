@@ -615,8 +615,9 @@ def get_applicable_discounts(order):
 
 def calculate_discount(base_price, discounts, mode="sequential"):
     """Calculate fixed-ruble and percentage discounts.
-    Sequential applies each rule in order; summed combines fixed amounts and
-    percentages against the original base price, capped at the base.
+    Sequential applies each rule in order. Percentage values are the share of
+    the original price that remains after the discount; fixed values subtract
+    the specified amount.
     """
     base = float(base_price)
     if not discounts:
@@ -640,7 +641,9 @@ def calculate_discount(base_price, discounts, mode="sequential"):
             if value_type(d) == "RUB":
                 final -= value
             else:
-                final *= (1 - min(value, 100.0) / 100.0)
+                # Процентная скидка хранится как доля цены, которую нужно оставить.
+                # Например, 91.67% от 24 ₽ = 22 ₽.
+                final *= min(value, 100.0) / 100.0
             final = max(final, 0.0)
         discount_amount = base - final
     final = round(max(final, 0.0), 2)
