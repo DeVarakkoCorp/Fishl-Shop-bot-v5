@@ -1612,7 +1612,6 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 1. Email/login
     if context.user_data.get("waiting_for_login"):
         email_pattern = r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
         if len(text) > 254 or not re.fullmatch(email_pattern, text):
@@ -1783,7 +1782,6 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает справку в зависимости от типа пользователя."""
     if is_manager(update):
         text = (
             "👨‍💼 *Помощь для менеджера*\n\n"
