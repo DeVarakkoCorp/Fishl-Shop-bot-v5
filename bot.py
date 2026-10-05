@@ -12,7 +12,7 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
 from config import (
@@ -428,6 +428,7 @@ def tier_keyboard(region):
 
 def service_category_keyboard():
     rows=[[InlineKeyboardButton(c["name"],callback_data=f"service_category_db:{c['id']}")] for c in get_service_categories()]
+    rows.append([InlineKeyboardButton("🧹 Зачистка по регионам",callback_data="cleanup_regions")])
     rows.append([InlineKeyboardButton("Для 57+ рангов",callback_data="service_57")])
     rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="back")])
     return InlineKeyboardMarkup(rows)
@@ -517,13 +518,12 @@ def price_category_keyboard():
 
 def admin_keyboard(order_id, status="new"):
     rows = []
-    if status == "new":
-        rows.append([InlineKeyboardButton("🟡 Взять заказ", callback_data=f"order_status:{order_id}:taken")])
     if status in ("new", "taken"):
-        rows.append([InlineKeyboardButton("🔵 В работу", callback_data=f"order_status:{order_id}:working")])
-    if status in ("taken", "working"):
-        rows.append([InlineKeyboardButton("✅ Выполнен", callback_data=f"order_status:{order_id}:done")])
-        rows.append([InlineKeyboardButton("❌ Отменить", callback_data=f"order_status:{order_id}:cancelled")])
+        rows.append([InlineKeyboardButton("🔵 Взять в работу", callback_data=f"order_status:{order_id}:working")])
+        rows.append([InlineKeyboardButton("❌ Отказаться", callback_data=f"order_status:{order_id}:cancelled")])
+    elif status == "working":
+        rows.append([InlineKeyboardButton("✅ Выполнить", callback_data=f"order_status:{order_id}:done")])
+        rows.append([InlineKeyboardButton("❌ Отказаться", callback_data=f"order_status:{order_id}:cancelled")])
     return InlineKeyboardMarkup(rows) if rows else None
 
 
@@ -833,21 +833,38 @@ async def show_manager_all_orders(update: Update, context: ContextTypes.DEFAULT_
 
     rows = get_all_manager_orders(50)
     if not rows:
-        text = "📦 *Все заказы*\n\nЗаказов пока нет."
-    else:
-        blocks = ["📦 *Все заказы из всех доступных баз*\n"]
-        for row in rows:
-            blocks.append(format_admin_order(row))
-            if row.get("_is_archive"):
-                blocks.append(f"🗄 Источник: `{row['_source_db']}`\n⚠️ Архивный заказ — изменение статуса из этой панели недоступно.")
-        blocks.append("\nПоказаны последние 50 уникальных заказов из всех доступных баз.")
-        text = "\n\n".join(blocks)
+        text = "📦 *Все заказы из всех доступных баз*\n\nЗаказов пока нет."
+        if edit:
+            await update.callback_query.edit_message_text(text, reply_markup=manager_all_orders_keyboard(), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=manager_all_orders_keyboard(), parse_mode="Markdown")
+        return
 
-    markup = manager_all_orders_keyboard()
     if edit:
-        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+        await update.callback_query.edit_message_text(
+            "📦 *Все заказы из всех доступных баз*\n\nНиже показаны последние 50 уникальных заказов.",
+            reply_markup=manager_all_orders_keyboard(),
+            parse_mode="Markdown",
+        )
     else:
-        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+        await update.message.reply_text(
+            "📦 *Все заказы из всех доступных баз*\n\nНиже показаны последние 50 уникальных заказов.",
+            reply_markup=manager_all_orders_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    for row in rows:
+        text = format_admin_order(row)
+        if row.get("_is_archive"):
+            text += f"\n\n🗄 Источник: `{row['_source_db']}`\n⚠️ Архивный заказ — изменение статуса из этой панели недоступно."
+            markup = None
+        else:
+            markup = admin_keyboard(row["id"], row["status"]) if row.get("status") in ("new", "taken", "working") else None
+        await update.effective_chat.send_message(
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
 
 
 def client_orders_keyboard():
@@ -1612,6 +1629,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # 1. Email/login
     if context.user_data.get("waiting_for_login"):
         email_pattern = r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
         if len(text) > 254 or not re.fullmatch(email_pattern, text):
@@ -1782,6 +1800,7 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает справку в зависимости от типа пользователя."""
     if is_manager(update):
         text = (
             "👨‍💼 *Помощь для менеджера*\n\n"
@@ -1978,10 +1997,36 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled exception:", exc_info=context.error)
 
 
+async def set_bot_commands(application):
+    client_commands = [
+        BotCommand("start", "Запустить бота"),
+        BotCommand("menu", "Открыть главное меню"),
+        BotCommand("myorders", "Мои заказы"),
+        BotCommand("help", "Помощь"),
+    ]
+    manager_commands = client_commands + [
+        BotCommand("manager", "Панель менеджера"),
+        BotCommand("orders", "Активные заказы"),
+        BotCommand("allorders", "Все заказы"),
+        BotCommand("backup", "Сделать бэкап"),
+        BotCommand("chatid", "Показать ID чата"),
+    ]
+
+    await application.bot.set_my_commands(client_commands)
+    for chat_id in ADMIN_CHAT_IDS:
+        try:
+            await application.bot.set_my_commands(
+                manager_commands,
+                scope=BotCommandScopeChat(chat_id=chat_id),
+            )
+        except Exception:
+            logger.exception("Не удалось установить список команд для чата менеджера %s", chat_id)
+
+
 def main():
     ensure_persistent_databases()
     db().close()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(set_bot_commands).build()
     if github_backup_enabled():
         interval = max(15, int(GITHUB_BACKUP_INTERVAL_MINUTES))
         app.job_queue.run_repeating(scheduled_github_backup, interval=interval * 60, first=30)
