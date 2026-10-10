@@ -1,0 +1,2117 @@
+import base64
+import json
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import tempfile
+import urllib.error
+import urllib.request
+import zipfile
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+
+from config import (
+    BOT_TOKEN, MANAGER_USERNAME, MANAGER_USERNAMES, ADMIN_CHAT_ID, ADMIN_CHAT_IDS, SHOP_NAME,
+    GITHUB_TOKEN, GITHUB_REPO, GITHUB_BACKUP_BRANCH, GITHUB_BACKUP_PATH,
+    GITHUB_BACKUP_INTERVAL_MINUTES,
+)
+from prices import PRICES, EXTRA_PRICES, PRICE_CATEGORIES
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# Railway Volume: при наличии тома Railway задаёт RAILWAY_VOLUME_MOUNT_PATH
+# автоматически. Если том ещё не подключён локально, используем ./data.
+VOLUME_PATH = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", str(BASE_DIR / "data"))
+DATA_DIR = Path(VOLUME_PATH)
+DB_PATH = DATA_DIR / "orders.db"
+orders = {}
+
+
+def ensure_persistent_databases():
+    """Создаёт каталог данных и один раз переносит DB из репозитория в Volume."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for seed in sorted(BASE_DIR.glob("orders*.db")):
+        destination = DATA_DIR / seed.name
+        if destination.exists():
+            continue
+        try:
+            shutil.copy2(seed, destination)
+            logger.info("Скопирована исходная БД в persistent storage: %s", destination)
+        except OSError:
+            logger.exception("Не удалось скопировать %s в %s", seed, destination)
+
+
+def github_backup_enabled():
+    return bool(GITHUB_TOKEN and GITHUB_REPO and GITHUB_BACKUP_BRANCH)
+
+
+def github_api(method, path, payload=None):
+    url = "https://api.github.com" + path
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "X-GitHub-Api-Version": "2026-03-10",
+            "User-Agent": "Fishl-Shop-Bot",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        body = response.read()
+        return response.status, json.loads(body.decode("utf-8")) if body else {}
+
+
+def ensure_github_backup_branch():
+    """Создаёт ветку бэкапов один раз, если её ещё нет."""
+    owner, repo = GITHUB_REPO.split("/", 1)
+    ref_path = f"/repos/{owner}/{repo}/git/ref/heads/{GITHUB_BACKUP_BRANCH}"
+    try:
+        github_api("GET", ref_path)
+        return
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+
+    default_ref = f"/repos/{owner}/{repo}/git/ref/heads/main"
+    try:
+        _, data = github_api("GET", default_ref)
+    except urllib.error.HTTPError:
+        default_ref = f"/repos/{owner}/{repo}/git/ref/heads/master"
+        _, data = github_api("GET", default_ref)
+
+    sha = data["object"]["sha"]
+    github_api("POST", f"/repos/{owner}/{repo}/git/refs", {
+        "ref": f"refs/heads/{GITHUB_BACKUP_BRANCH}",
+        "sha": sha,
+    })
+
+
+def create_sqlite_backup_bytes():
+    """Делает согласованный snapshot SQLite через backup API."""
+    if not DB_PATH.exists():
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "orders.db"
+        source = sqlite3.connect(DB_PATH)
+        destination = sqlite3.connect(target)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+        return target.read_bytes()
+
+
+def create_code_backup_bytes():
+    """Создаёт ZIP-снимок исходного кода и служебных файлов проекта."""
+    excluded_names = {
+        "orders.db", "orders_history.db",
+        "orders (2).db", "orders (3).db", "orders (4).db", "orders (5).db",
+    }
+    allowed_suffixes = {".py", ".md", ".txt", ".toml", ".yaml", ".yml", ".json", ".ini", ".gitattributes", ".gitignore"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "fishl_shop_code.zip"
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for source_path in sorted(BASE_DIR.rglob("*")):
+                if not source_path.is_file():
+                    continue
+                relative = source_path.relative_to(BASE_DIR)
+                if any(part in {".git", "__pycache__"} for part in relative.parts):
+                    continue
+                if source_path.name in excluded_names or source_path.suffix.lower() == ".db":
+                    continue
+                if source_path.suffix.lower() not in allowed_suffixes and source_path.name not in {"requirements.txt", "Dockerfile"}:
+                    continue
+                zf.write(source_path, relative.as_posix())
+        return archive.read_bytes()
+
+
+def upload_github_backup():
+    """Загружает согласованный snapshot БД и ZIP-снимок кода в отдельную ветку GitHub."""
+    if not github_backup_enabled():
+        return False
+
+    db_content = create_sqlite_backup_bytes()
+    if not db_content:
+        logger.warning("GitHub backup skipped: orders.db отсутствует")
+        return False
+
+    code_content = create_code_backup_bytes()
+    ensure_github_backup_branch()
+    owner, repo = GITHUB_REPO.split("/", 1)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    branch = GITHUB_BACKUP_BRANCH
+    root = GITHUB_BACKUP_PATH.strip("/").strip()
+
+    uploads = [
+        (f"{root}/orders_{timestamp}.db", db_content, f"Backup orders.db {timestamp}"),
+        (f"{root}/../code/code_{timestamp}.zip", code_content, f"Backup bot code {timestamp}"),
+    ]
+    for path, content, message in uploads:
+        payload = {
+            "message": message,
+            "content": base64.b64encode(content).decode("ascii"),
+            "branch": branch,
+        }
+        github_api("PUT", f"/repos/{owner}/{repo}/contents/{path}", payload)
+        logger.info("GitHub backup uploaded: %s:%s", branch, path)
+    return True
+
+
+
+def region_tp_quantity_keyboard(order_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{q} ТП", callback_data=f"region_tp_qty:{order_id}:{q}")]
+        for q in REGION_TP_QUANTITY_OPTIONS
+    ])
+
+async def scheduled_github_backup(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        upload_github_backup()
+    except Exception:
+        logger.exception("GitHub backup failed")
+
+MAIN_MENU = InlineKeyboardMarkup([
+    [InlineKeyboardButton("💰 Прайсы", callback_data="prices")],
+    [InlineKeyboardButton("🛒 Заказать услугу", callback_data="cleanup")],
+    [InlineKeyboardButton("📋 Мои заказы", callback_data="my_orders")],
+    [InlineKeyboardButton("📞 Связь", callback_data="contact")],
+])
+
+TIER_NAMES = ["0–100%", "50–100%", "80–100%"]
+TIER_KEYS = ["0-100", "50-100", "80-100"]
+
+DIKOVINKI_PRICES = {
+    "Мондштадт": 1.0,
+    "Ли Юэ": 1.5,
+    "Инадзума": 1.5,
+    "Сумеру": 2.0,
+    "Фонтейн": 1.5,
+    "Натлан, Снежная": 2.0,
+}
+
+OKULY_PRICES = [
+    ("Анемокулы", 200),
+    ("Геокулы", 1000),
+    ("Багровые агаты", 500),
+    ("Электрокулы", 700),
+    ("Адъюванты светоносного камня", 550),
+    ("Гидрокулы", 1200),
+    ("Оперенья очищающего света", 690),
+    ("Кои карпы", 1100),
+    ("Пирокулы", 550),
+    ("Лунокулы", 1500),
+    ("Лунокулы — на данный момент", 1000),
+    ("Криокулы", 1500),
+]
+
+RANK57_PRICES = {
+    "Крутки": "КРУТКИ💫\n\n💫1 крутка — 30 рублей💫\n💫10 круток — 300 рублей💫\n💫100 круток — 3000 рублей💫",
+    "ЭНДГЕЙМ": "ЭНДГЕЙМ🌟\n\n🌱10 этаж бездны — 120 рублей\n🌙11 этаж бездны — 150 рублей\n🌙12 этаж бездны — 300 рублей",
+    "Натиск": "НАТИСК🌟\n\n🎂4 уровень сложности — 300 рублей\n🎂5 уровень сложности — 600 рублей\n\n(Дочистку временно не принимаю)",
+    "Театр": "Театр🌟\n\nОбычная сложность (3 этапа) — 200₽🤩\nСредняя сложность (6 этапов) — 350₽🤩\nСложная сложность (9 этапов) — 450₽🤩🤩\nАрканы — 1000₽🤩",
+}
+RANK57_CATEGORIES = list(RANK57_PRICES.keys())
+
+# TP quantity options for regional cleanup.
+REGION_TP_QUANTITY_OPTIONS = [1, 5, 10, 20, 50, 100]
+
+def region_tp_price(base_price, quantity):
+    """Price regional TP cleanup proportionally to the selected TP quantity."""
+    return round(float(base_price) * quantity / 100)
+
+STATUS_LABELS = {"new": "🆕 Новый", "taken": "🟡 Взято", "working": "🔵 В работе", "done": "✅ Выполнен", "cancelled": "❌ Отменён"}
+
+# Доступ к панели менеджера только для этих Telegram-юзернеймов.
+def normalize_username(username):
+    return (username or "").strip().lstrip("@").lower()
+
+
+def is_manager(update: Update):
+    user = update.effective_user
+    return bool(user and normalize_username(user.username) in MANAGER_USERNAMES)
+
+
+def format_price(value):
+    value = float(value)
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            client_telegram_id INTEGER NOT NULL,
+            client_name TEXT NOT NULL,
+            uid TEXT NOT NULL,
+            server TEXT NOT NULL,
+            region TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'new',
+            manager_name TEXT DEFAULT '',
+            service TEXT DEFAULT '',
+            details TEXT DEFAULT '',
+            original_price REAL DEFAULT NULL,
+            discount_amount REAL DEFAULT 0,
+            discount_mode TEXT DEFAULT ''
+        )
+    """)
+    # Upgrade databases created by older versions.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)").fetchall()}
+    if "service" not in columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN service TEXT DEFAULT ''")
+    if "details" not in columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN details TEXT DEFAULT ''")
+    if "original_price" not in columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN original_price REAL DEFAULT NULL")
+    if "discount_amount" not in columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN discount_amount REAL DEFAULT 0")
+    if "discount_mode" not in columns:
+        conn.execute("ALTER TABLE orders ADD COLUMN discount_mode TEXT DEFAULT ''")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS discounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            threshold REAL DEFAULT 0,
+            service TEXT DEFAULT '',
+            percent REAL NOT NULL,
+            value_type TEXT NOT NULL DEFAULT '%',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            expires_at TEXT DEFAULT NULL
+        )
+    """)
+    dcols = {row[1] for row in conn.execute("PRAGMA table_info(discounts)").fetchall()}
+    if "value_type" not in dcols:
+        conn.execute("ALTER TABLE discounts ADD COLUMN value_type TEXT NOT NULL DEFAULT '%'")
+    if "expires_at" not in dcols:
+        conn.execute("ALTER TABLE discounts ADD COLUMN expires_at TEXT DEFAULT NULL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS service_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            active INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS service_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            price REAL NOT NULL DEFAULT 0,
+            quantity_mode TEXT NOT NULL DEFAULT 'fixed',
+            unit TEXT NOT NULL DEFAULT 'шт.',
+            active INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(category_id) REFERENCES service_categories(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS region_price_overrides (
+            region TEXT PRIMARY KEY,
+            price_0_100 REAL NOT NULL,
+            price_50_100 REAL NOT NULL,
+            price_80_100 REAL NOT NULL
+        )
+    """)
+    conn.commit()
+    seed_dynamic_services(conn)
+    # Fix the old teleport placeholder in case the dynamic table already existed.
+    conn.execute("UPDATE service_items SET name='Тп в любые доп. локации (1шт)' WHERE name LIKE '%Тп в ???%'")
+    conn.commit()
+    return conn
+
+
+def seed_dynamic_services(conn):
+    existing = conn.execute("SELECT COUNT(*) FROM service_categories").fetchone()[0]
+    if existing:
+        return
+    for cat_index, category in enumerate(PRICE_CATEGORIES):
+        cur = conn.execute("INSERT INTO service_categories(name,active,sort_order) VALUES (?,1,?)", (category, cat_index))
+        category_id = cur.lastrowid
+        if category == "Крутки":
+            items = [("1 крутка",24,"fixed","крутка"),("10 круток",240,"fixed","комплект"),("100 круток",2400,"fixed","комплект"),("Своя количество",24,"quantity","крутка")]
+        elif category == "Диковинки":
+            items = [(region,price,"quantity","шт.") for region,price in DIKOVINKI_PRICES.items()]
+        elif category == "Окулы":
+            items = [(name,price,"quantity","шт.") for name,price in OKULY_PRICES]
+        else:
+            items=[]
+            for line in [line.strip() for line in EXTRA_PRICES[category].split("\n") if line.strip()]:
+                if line.startswith("Уточняйте в лс") or line.startswith("(") or line in {"КРУТКИ","ЭНДГЕЙМ","НАТИСК","Театр🌟"}:
+                    continue
+                match=re.search(r"(\d+(?:\.5)?)\s*(?:₽|руб(?:лей|ля)?|рубл(?:ей|я)?)",line,re.I)
+                if not match: continue
+                name=line
+                if category == "Телепорты":
+                    name=re.sub(r"Тп в \?\?\?","Тп в любые доп. локации",name,flags=re.I)
+                    mode,unit="quantity","ТП"
+                else:
+                    mode,unit="fixed","шт."
+                items.append((name,float(match.group(1)),mode,unit))
+        for item_index,(name,price,mode,unit) in enumerate(items):
+            conn.execute("INSERT INTO service_items(category_id,name,price,quantity_mode,unit,active,sort_order) VALUES (?,?,?,?,?,1,?)",(category_id,name,price,mode,unit,item_index))
+    for region,values in PRICES.items():
+        conn.execute("INSERT OR IGNORE INTO region_price_overrides(region,price_0_100,price_50_100,price_80_100) VALUES (?,?,?,?)",(region,values["0-100"],values["50-100"],values["80-100"]))
+
+
+def get_service_categories(active_only=True):
+    conn=db(); where="WHERE active=1" if active_only else ""
+    rows=conn.execute(f"SELECT * FROM service_categories {where} ORDER BY sort_order,id").fetchall(); conn.close(); return rows
+
+
+def get_service_category(category_id):
+    conn=db(); row=conn.execute("SELECT * FROM service_categories WHERE id=?",(category_id,)).fetchone(); conn.close(); return row
+
+
+def get_service_items(category_id, active_only=True):
+    conn=db(); where="AND active=1" if active_only else ""
+    rows=conn.execute(f"SELECT * FROM service_items WHERE category_id=? {where} ORDER BY sort_order,id",(category_id,)).fetchall(); conn.close(); return rows
+
+
+def get_service_item(item_id):
+    conn=db(); row=conn.execute("SELECT si.*, sc.name AS category_name FROM service_items si JOIN service_categories sc ON sc.id=si.category_id WHERE si.id=?",(item_id,)).fetchone(); conn.close(); return row
+
+
+def get_region_prices(region):
+    conn=db(); row=conn.execute("SELECT * FROM region_price_overrides WHERE region=?",(region,)).fetchone(); conn.close()
+    if row:
+        return {"0-100":row["price_0_100"],"50-100":row["price_50_100"],"80-100":row["price_80_100"]}
+    return PRICES[region]
+
+
+def service_category_text(category_id):
+    category=get_service_category(category_id); items=get_service_items(category_id)
+    if not category: return ""
+    lines=[category["name"]]
+    for item in items:
+        if category["name"] == "Крутки" and item["quantity_mode"] == "quantity":
+            continue
+        shown = price_with_discount_text(item["price"], category["name"])
+        if item["quantity_mode"]=="quantity": lines.append(f"{item['name']} — {shown}/{item['unit']}")
+        else: lines.append(f"{item['name']} — {shown}")
+    return "\n".join(lines)
+
+
+def region_keyboard(callback_prefix="region"):
+    rows = [[InlineKeyboardButton(region, callback_data=f"{callback_prefix}:{region}")] for region in PRICES]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tier_keyboard(region):
+    prices = get_region_prices(region)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"0–100% — {price_with_discount_text(prices['0-100'], 'Зачистка по регионам')}", callback_data=f"tier:{region}:0")],
+        [InlineKeyboardButton(f"50–100% — {price_with_discount_text(prices['50-100'], 'Зачистка по регионам')}", callback_data=f"tier:{region}:1")],
+        [InlineKeyboardButton(f"80–100% — {price_with_discount_text(prices['80-100'], 'Зачистка по регионам')}", callback_data=f"tier:{region}:2")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="cleanup")],
+    ])
+
+
+def service_category_keyboard():
+    rows=[[InlineKeyboardButton(c["name"],callback_data=f"service_category_db:{c['id']}")] for c in get_service_categories()]
+    rows.append([InlineKeyboardButton("🧹 Зачистка по регионам",callback_data="cleanup_regions")])
+    rows.append([InlineKeyboardButton("Для 57+ рангов",callback_data="service_57")])
+    rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def rank57_keyboard(prefix):
+    rows = [[InlineKeyboardButton(name, callback_data=f"{prefix}:{i}")] for i, name in enumerate(RANK57_CATEGORIES)]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="cleanup" if prefix == "service57_category" else "prices")])
+    return InlineKeyboardMarkup(rows)
+
+
+def rank57_item_keyboard(category_index):
+    category = RANK57_CATEGORIES[category_index]
+    lines = [line.strip() for line in RANK57_PRICES[category].split("\n") if line.strip()]
+    rows = []
+    import re
+    for i, line in enumerate(lines):
+        if line == category or line.startswith("("):
+            continue
+        if re.search(r"\d+(?:\.5)?\s*(?:₽|руб(?:лей|ля)?|рубл(?:ей|я)?)", line, re.I):
+            rows.append([InlineKeyboardButton(line[:60], callback_data=f"rank57_item:{category_index}:{i}")])
+    if category == "Крутки":
+        rows.append([InlineKeyboardButton("✏️ Ввести своё количество", callback_data="custom_quantity:spins:57")])
+    rows.append([InlineKeyboardButton("⬅️ К услугам", callback_data="cleanup")])
+    return InlineKeyboardMarkup(rows)
+
+
+def rank57_item_data(category_index, item_index):
+    import re
+    if category_index < 0 or category_index >= len(RANK57_CATEGORIES):
+        return None
+    category = RANK57_CATEGORIES[category_index]
+    lines = [line.strip() for line in RANK57_PRICES[category].split("\n") if line.strip()]
+    if item_index < 0 or item_index >= len(lines):
+        return None
+    line = lines[item_index]
+    if line == category or line.startswith("("):
+        return None
+    match = re.search(r"(\d+(?:\.5)?)\s*(?:₽|руб(?:лей|ля)?|рубл(?:ей|я)?)", line, re.I)
+    if not match:
+        return None
+    price = int(float(match.group(1)))
+    return category, line, price
+
+
+def service_item_keyboard(category_id):
+    category=get_service_category(category_id)
+    if not category: return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К услугам",callback_data="cleanup")]])
+    items=get_service_items(category_id); rows=[]
+    for item in items:
+        if category["name"] == "Крутки" and item["quantity_mode"] == "quantity":
+            continue
+        suffix=f" ₽/{item['unit']}" if item["quantity_mode"]=="quantity" else " ₽"
+        rows.append([InlineKeyboardButton(f"{item['name']} — {format_price(item['price'])}{suffix}",callback_data=f"service_item_db:{item['id']}")])
+    if category["name"] == "Крутки":
+        custom=next((i for i in items if i["quantity_mode"]=="quantity"),None)
+        if custom: rows.append([InlineKeyboardButton("✏️ Ввести своё количество",callback_data=f"service_item_custom:{custom['id']}")])
+    rows.append([InlineKeyboardButton("⬅️ К услугам",callback_data="cleanup")])
+    return InlineKeyboardMarkup(rows)
+
+
+def service_item_data_db(item_id):
+    row=get_service_item(item_id)
+    return row if row and row["active"] else None
+
+
+def cleanup_region_keyboard():
+    return region_keyboard()
+
+
+def price_region_keyboard():
+    rows=[[InlineKeyboardButton("🧹 Зачистка по регионам",callback_data="price_cleanup")]]
+    for category in get_service_categories():
+        rows.append([InlineKeyboardButton(category["name"],callback_data=f"price_category_db:{category['id']}")])
+    rows.append([InlineKeyboardButton("Для 57+ рангов",callback_data="price_57")])
+    rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def price_category_keyboard():
+    rows = []
+    for i, category in enumerate(PRICE_CATEGORIES):
+        rows.append([InlineKeyboardButton(category, callback_data=f"price_category:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ К прайсам", callback_data="prices")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_keyboard(order_id, status="new"):
+    rows = []
+    if status in ("new", "taken"):
+        rows.append([InlineKeyboardButton("🔵 Взять в работу", callback_data=f"order_status:{order_id}:working")])
+        rows.append([InlineKeyboardButton("❌ Отказаться", callback_data=f"order_status:{order_id}:cancelled")])
+    elif status == "working":
+        rows.append([InlineKeyboardButton("✅ Выполнить", callback_data=f"order_status:{order_id}:done")])
+        rows.append([InlineKeyboardButton("❌ Отказаться", callback_data=f"order_status:{order_id}:cancelled")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def manager_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Все заказы", callback_data="mgr_all_orders")],
+        [InlineKeyboardButton("➕ Добавить скидку", callback_data="mgr_discount_add")],
+        [InlineKeyboardButton("📋 Активные скидки", callback_data="mgr_discount_list")],
+        [InlineKeyboardButton("🗑 Управление скидками", callback_data="mgr_discount_manage")],
+        [InlineKeyboardButton("🛠 Услуги и цены", callback_data="mgr_services")],
+        [InlineKeyboardButton("💾 Сделать бэкап", callback_data="mgr_backup")],
+    ])
+
+
+def discount_kind_label(row):
+    if row["kind"] == "threshold":
+        return f"На заказ от {format_price(row['threshold'])} ₽"
+    return f"На услугу: {row['service']}"
+
+def discount_value_label(row):
+    value_type = row["value_type"] if "value_type" in row.keys() else "%"
+    suffix = "%" if value_type == "%" else " ₽"
+    return f"{format_price(row['percent'])}{suffix}"
+
+def discount_period_label(row):
+    return "без срока" if not row["expires_at"] else f"до {row['expires_at']}"
+
+
+def get_active_discounts():
+    conn = db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("UPDATE discounts SET active=0 WHERE active=1 AND expires_at IS NOT NULL AND expires_at <= ?", (now,))
+    conn.commit()
+    rows = conn.execute("SELECT * FROM discounts WHERE active=1 ORDER BY id DESC").fetchall()
+    conn.close()
+    return rows
+
+
+def get_service_discounted_price(base_price, service):
+    base = float(base_price)
+    service_name = str(service or "").strip().lower()
+    if not service_name:
+        return round(base, 2)
+    discounts = [
+        row for row in get_active_discounts()
+        if row["kind"] == "service"
+        and service_name == str(row["service"] or "").strip().lower()
+    ]
+    if not discounts:
+        return round(base, 2)
+    final, _ = calculate_discount(base, discounts, mode="sequential")
+    return round(final, 2)
+
+
+def price_with_discount_text(base_price, service):
+    base = float(base_price)
+    final = get_service_discounted_price(base, service)
+    if final < base:
+        return f"{format_price(final)} ₽ (было {format_price(base)} ₽)"
+    return f"{format_price(base)} ₽"
+
+
+def format_rank57_prices(category):
+    text = RANK57_PRICES[category]
+    import re
+
+    def replace_price(match):
+        value = float(match.group(1))
+        final = get_service_discounted_price(value, category)
+        if final < value:
+            return f"{format_price(final)} ₽ (было {format_price(value)} ₽)"
+        return match.group(0)
+
+    return re.sub(r"(\d+(?:\.5)?)\s*(?:₽|руб(?:лей|ля)?|рубл(?:ей|я)?)", replace_price, text, flags=re.I)
+
+
+def get_applicable_discounts(order):
+    total = float(order.get("price", 0))
+    service = str(order.get("service", "")).strip().lower()
+    result = []
+    for row in get_active_discounts():
+        if row["kind"] == "threshold" and total >= float(row["threshold"]):
+            result.append(row)
+        elif row["kind"] == "service" and service and service == str(row["service"]).strip().lower():
+            result.append(row)
+    return result
+
+
+def calculate_discount(base_price, discounts, mode="sequential"):
+    """Calculate fixed-ruble and percentage discounts.
+    Sequential applies each rule in order. Percentage values are the share of
+    the original price that remains after the discount; fixed values subtract
+    the specified amount.
+    """
+    base = float(base_price)
+    if not discounts:
+        return base, 0.0
+    threshold = [d for d in discounts if d["kind"] == "threshold"]
+    service = [d for d in discounts if d["kind"] == "service"]
+    ordered = threshold + service
+
+    def value_type(d):
+        return d["value_type"] if "value_type" in d.keys() else "%"
+
+    if mode == "summed":
+        percent = sum(min(max(float(d["percent"]), 0.0), 100.0) for d in ordered if value_type(d) == "%")
+        fixed = sum(max(float(d["percent"]), 0.0) for d in ordered if value_type(d) == "RUB")
+        discount_amount = min(base, base * min(percent, 100.0) / 100.0 + fixed)
+        final = base - discount_amount
+    else:
+        final = base
+        for d in ordered:
+            value = max(float(d["percent"]), 0.0)
+            if value_type(d) == "RUB":
+                final -= value
+            else:
+                # Процентная скидка хранится как доля цены, которую нужно оставить.
+                # Например, 91.67% от 24 ₽ = 22 ₽.
+                final *= min(value, 100.0) / 100.0
+            final = max(final, 0.0)
+        discount_amount = base - final
+    final = round(max(final, 0.0), 2)
+    return final, round(base - final, 2)
+
+def discount_description(rows):
+    return "\n".join(
+        f"#{row['id']} — {discount_kind_label(row)} — *{discount_value_label(row)}* — {discount_period_label(row)}"
+        for row in rows
+    )
+
+
+async def show_manager_panel(update: Update, edit=False):
+    if not is_manager(update):
+        if edit:
+            await update.callback_query.answer("Недоступно", show_alert=True)
+        else:
+            await update.message.reply_text("❌ Доступ запрещён.")
+        return
+    text = "👨‍💼 *Панель менеджера*\n\nВыбери действие:"
+    if edit:
+        await update.callback_query.edit_message_text(text, reply_markup=manager_keyboard(), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=manager_keyboard(), parse_mode="Markdown")
+
+
+def format_discount_choice(order_id, rows):
+    lines = [f"🏷 *Для заказа №{order_id} доступны скидки:*", ""]
+    for row in rows:
+        lines.append(f"• {discount_kind_label(row)} — *{discount_value_label(row)}*")
+    lines += [
+        "",
+        "Выбери, как применить скидки:",
+        "• *Сложить проценты* — например 10% + 5% = 15%.",
+        "• *Последовательно* — сначала скидка на весь заказ, затем на конкретную услугу.",
+    ]
+    return "\n".join(lines)
+
+
+def format_admin_order(row):
+    row = dict(row)
+    status = STATUS_LABELS.get(row["status"], row["status"])
+    manager = f"\n👨‍💼 Менеджер: {row['manager_name']}" if row["manager_name"] else ""
+    return (
+        f"🧾 *Заказ №{row['id']}*\n\n"
+        f"{status}\n"
+        f"🕐 Создан: `{row['created_at']}`\n"
+        f"👤 Клиент: {row['client_name']}\n"
+        f"🆔 Telegram ID: `{row['client_telegram_id']}`\n"
+        f"📍 Регион: *{row['region']}*\n"
+        f"🛒 Услуга: *{row['service'] or 'Зачистка по регионам'}*\n"
+        f"📦 Вариант: *{row['tier']}*\n"
+        f"💰 Цена: *{format_price(row['price'])} ₽*"
+        + (f"\n💸 Скидка: *{format_price(row['discount_amount'])} ₽*" if row.get('discount_amount') else "")
+        + (f"\n💰 Цена без скидки: *{format_price(row['original_price'])} ₽*" if row.get('original_price') is not None and float(row['original_price']) != float(row['price']) else "")
+        + (f"\n📝 Детали: {row['details']}" if row['details'] else "")
+        + manager
+    )
+
+
+def is_admin_chat(update: Update):
+    return bool(
+        ADMIN_CHAT_IDS
+        and update.effective_chat
+        and update.effective_chat.id in ADMIN_CHAT_IDS
+    )
+
+
+async def send_to_admin_chats(context: ContextTypes.DEFAULT_TYPE, text, **kwargs):
+    """Send a manager notification to every configured admin chat.
+
+    Each chat is attempted independently so one invalid/blocked chat does not
+    prevent the other managers from receiving the notification.
+    Returns (successful_count, failed_chat_ids).
+    """
+    sent = 0
+    failed = []
+    for chat_id in ADMIN_CHAT_IDS:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            sent += 1
+        except Exception:
+            failed.append(chat_id)
+            logger.exception("Failed to send manager notification to chat %s", chat_id)
+    return sent, failed
+
+
+def format_client_order(row):
+    status = STATUS_LABELS.get(row["status"], row["status"])
+    service = row["service"] or "Зачистка по регионам"
+    tier = row["tier"] or "Не указан"
+    region = row["region"] or "Не указан"
+    details = f"\n📝 {row['details']}" if row["details"] else ""
+    order_label = ("архив-" + str(row["id"])) if row.get("_is_archive") else str(row["id"])
+    discount = (f"\n💸 Скидка: *{format_price(row['discount_amount'])} ₽*" if row.get("discount_amount") else "")
+    return (
+        f"🧾 *Заказ №{order_label}*\n"
+        f"{status}\n"
+        f"🕐 {row['created_at']}\n"
+        f"🛒 {service}\n"
+        f"📦 {tier}\n"
+        f"📍 {region}\n"
+        f"💰 *{format_price(row['price'])} ₽*"
+        f"{discount}"
+        f"{details}"
+    )
+
+
+def get_order_database_paths():
+    """Все DB внутри persistent storage Volume."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    paths = sorted(DATA_DIR.glob("orders*.db"), key=lambda p: (p.name != "orders.db", p.name))
+    if DB_PATH not in paths:
+        paths.insert(0, DB_PATH)
+    return paths
+
+
+def get_client_orders(user_id, limit=20):
+    """Find the customer's orders across the live DB and all order archives."""
+    found = []
+    seen = set()
+
+    for path in get_order_database_paths():
+        try:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='orders'"
+            ).fetchone()
+            if not table_exists:
+                conn.close()
+                continue
+
+            rows = conn.execute(
+                "SELECT * FROM orders WHERE client_telegram_id=?",
+                (user_id,),
+            ).fetchall()
+            conn.close()
+
+            for row in rows:
+                data = dict(row)
+                data.setdefault("service", "")
+                data.setdefault("details", "")
+
+                fingerprint = (
+                    data.get("client_telegram_id"),
+                    data.get("created_at"),
+                    data.get("client_name"),
+                    data.get("price"),
+                    data.get("service", ""),
+                    data.get("details", ""),
+                    data.get("region", ""),
+                    data.get("tier", ""),
+                    data.get("uid", ""),
+                    data.get("server", ""),
+                )
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+
+                data["_source_db"] = path.name
+                data["_is_archive"] = path != DB_PATH
+                found.append(data)
+
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("Не удалось прочитать базу заказов %s: %s", path, exc)
+
+    found.sort(key=lambda row: str(row.get("created_at", "")), reverse=True)
+    return found[:limit]
+
+def get_all_manager_orders(limit=50):
+    """Return orders from the live DB and every archived orders*.db, deduplicated."""
+    found = []
+    seen = set()
+
+    for path in get_order_database_paths():
+        try:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='orders'"
+            ).fetchone()
+            if not table_exists:
+                conn.close()
+                continue
+            rows = conn.execute("SELECT * FROM orders ORDER BY created_at DESC").fetchall()
+            conn.close()
+            for row in rows:
+                data = dict(row)
+                data.setdefault("service", "")
+                data.setdefault("details", "")
+                data.setdefault("original_price", None)
+                data.setdefault("discount_amount", 0)
+                data.setdefault("discount_mode", "")
+                fingerprint = (
+                    data.get("client_telegram_id"), data.get("created_at"),
+                    data.get("client_name"), data.get("price"),
+                    data.get("service", ""), data.get("details", ""),
+                    data.get("region", ""), data.get("tier", ""),
+                    data.get("uid", ""), data.get("server", ""),
+                )
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                data["_source_db"] = path.name
+                data["_is_archive"] = path != DB_PATH
+                found.append(data)
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("Не удалось прочитать базу заказов %s: %s", path, exc)
+
+    found.sort(key=lambda row: str(row.get("created_at", "")), reverse=True)
+    return found[:limit]
+
+
+def manager_all_orders_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="mgr_all_orders")],
+        [InlineKeyboardButton("⬅️ Панель менеджера", callback_data="mgr_panel")],
+    ])
+
+
+async def show_manager_all_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
+    if not is_manager(update):
+        if edit:
+            await update.callback_query.answer("Недоступно", show_alert=True)
+        else:
+            await update.message.reply_text("❌ Доступ запрещён.")
+        return
+
+    rows = get_all_manager_orders(50)
+    if not rows:
+        text = "📦 *Все заказы из всех доступных баз*\n\nЗаказов пока нет."
+        if edit:
+            await update.callback_query.edit_message_text(text, reply_markup=manager_all_orders_keyboard(), parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=manager_all_orders_keyboard(), parse_mode="Markdown")
+        return
+
+    if edit:
+        await update.callback_query.edit_message_text(
+            "📦 *Все заказы из всех доступных баз*\n\nНиже показаны последние 50 уникальных заказов.",
+            reply_markup=manager_all_orders_keyboard(),
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "📦 *Все заказы из всех доступных баз*\n\nНиже показаны последние 50 уникальных заказов.",
+            reply_markup=manager_all_orders_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    for row in rows:
+        text = format_admin_order(row)
+        if row.get("_is_archive"):
+            text += f"\n\n🗄 Источник: `{row['_source_db']}`\n⚠️ Архивный заказ — изменение статуса из этой панели недоступно."
+            markup = None
+        else:
+            markup = admin_keyboard(row["id"], row["status"]) if row.get("status") in ("new", "taken", "working") else None
+        await update.effective_chat.send_message(
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+
+
+def client_orders_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="my_orders")],
+        [InlineKeyboardButton("🛒 Заказать услугу", callback_data="cleanup")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="back")],
+    ])
+
+
+async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
+    user_id = update.effective_user.id
+    rows = get_client_orders(user_id)
+    if not rows:
+        text = "📋 *Мои заказы*\n\nУ тебя пока нет оформленных заказов."
+    else:
+        blocks = ["📋 *Мои заказы*\n"]
+        for row in rows:
+            blocks.append(format_client_order(row))
+        blocks.append("\nПоказаны последние 20 заказов из всех доступных баз.")
+        text = "\n\n".join(blocks)
+
+    if edit:
+        await update.callback_query.edit_message_text(
+            text, reply_markup=client_orders_keyboard(), parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            text, reply_markup=client_orders_keyboard(), parse_mode="Markdown"
+        )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    orders.pop(update.effective_user.id, None)
+    context.user_data.clear()
+    await update.message.reply_text(f"🎮 *{SHOP_NAME}*\n\nВыбери нужный раздел:", reply_markup=MAIN_MENU, parse_mode="Markdown")
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    orders.pop(update.effective_user.id, None)
+    context.user_data.clear()
+    await update.message.reply_text(f"🎮 *{SHOP_NAME}*\n\nВыбери нужный раздел:", reply_markup=MAIN_MENU, parse_mode="Markdown")
+
+
+async def manager_services_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открывает раздел «Услуги и цены» отдельным обработчиком.
+
+    Отдельный handler нужен, чтобы этот callback не зависел от общего
+    диспетчера кнопок и всегда обрабатывался при нажатии кнопки менеджера.
+    """
+    query = update.callback_query
+    await query.answer()
+    if not is_manager(update):
+        await query.answer("Недоступно", show_alert=True)
+        return
+    try:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Добавить услугу", callback_data="mgr_service_add")],
+            [InlineKeyboardButton("➕ Добавить вариант", callback_data="mgr_service_item_add")],
+            [InlineKeyboardButton("✏️ Изменить цену услуги", callback_data="mgr_service_edit")],
+            [InlineKeyboardButton("🧹 Изменить цены зачистки", callback_data="mgr_region_edit")],
+            [InlineKeyboardButton("📋 Список услуг", callback_data="mgr_service_list")],
+            [InlineKeyboardButton("🏠 Панель менеджера", callback_data="mgr_panel")],
+        ])
+        await query.edit_message_text(
+            "🛠 *Услуги и цены*\n\nДобавляй новые услуги и меняй цены прямо из бота.",
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Failed to open manager services menu")
+        await query.edit_message_text(
+            "❌ Не удалось открыть раздел «Услуги и цены». Проверь логи Railway.",
+            reply_markup=manager_keyboard(),
+        )
+
+
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+
+    if data == "back":
+        orders.pop(user_id, None)
+        context.user_data.clear()
+        if is_manager(update):
+            await show_manager_panel(update, edit=True)
+        else:
+            await query.edit_message_text(f"🎮 *{SHOP_NAME}*\n\nВыбери нужный раздел:", reply_markup=MAIN_MENU, parse_mode="Markdown")
+        return
+
+    if data.startswith("mgr_"):
+        if not is_manager(update):
+            await query.answer("Недоступно", show_alert=True)
+            return
+        if data in {"mgr_panel", "mgr_back"}:
+            await show_manager_panel(update, edit=True)
+            return
+        if data == "mgr_all_orders":
+            await show_manager_all_orders(update, context, edit=True)
+            return
+
+        if data == "mgr_backup":
+            if not is_manager(update):
+                await query.answer("Недоступно", show_alert=True)
+                return
+            await query.answer("Делаю бэкап...")
+            try:
+                ok = upload_github_backup()
+                if ok:
+                    await query.edit_message_text("✅ Бэкап БД и кода загружен на GitHub.", reply_markup=manager_keyboard())
+                else:
+                    await query.edit_message_text("⚠️ GitHub-бэкап не настроен. Добавь переменные GITHUB_* в Railway.", reply_markup=manager_keyboard())
+            except Exception as exc:
+                logger.exception("Manual GitHub backup failed")
+                await query.edit_message_text(f"❌ Не удалось сделать бэкап: {exc}", reply_markup=manager_keyboard())
+            return
+        if data == "mgr_services":
+            await query.edit_message_text("🛠 *Услуги и цены*\n\nДобавляй новые услуги и меняй цены прямо из бота.",reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Добавить услугу",callback_data="mgr_service_add")],
+                [InlineKeyboardButton("➕ Добавить вариант",callback_data="mgr_service_item_add")],
+                [InlineKeyboardButton("✏️ Изменить цену услуги",callback_data="mgr_service_edit")],
+                [InlineKeyboardButton("🧹 Изменить цены зачистки",callback_data="mgr_region_edit")],
+                [InlineKeyboardButton("📋 Список услуг",callback_data="mgr_service_list")],
+                [InlineKeyboardButton("🏠 Панель менеджера",callback_data="mgr_panel")]],parse_mode="Markdown")); return
+        if data == "mgr_service_list":
+            lines=["🛠 *Услуги и цены*",""]
+            for cat in get_service_categories():
+                lines.append(f"*{cat['name']}*")
+                for item in get_service_items(cat["id"]):
+                    suffix=f"/{item['unit']}" if item["quantity_mode"]=="quantity" else ""
+                    lines.append(f"• {item['name']} — {format_price(item['price'])} ₽{suffix}")
+                lines.append("")
+            await query.edit_message_text("\n".join(lines)[:4000],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Услуги и цены",callback_data="mgr_services")]]),parse_mode="Markdown"); return
+        if data == "mgr_service_add":
+            context.user_data.clear(); context.user_data["manager_service_step"]="name"
+            await query.edit_message_text("➕ *Новая услуга*\n\nВведи название новой услуги:",parse_mode="Markdown"); return
+        if data == "mgr_service_item_add":
+            buttons=[[InlineKeyboardButton(c["name"],callback_data=f"mgr_service_item_category:{c['id']}")] for c in get_service_categories()]; buttons.append([InlineKeyboardButton("⬅️ Услуги и цены",callback_data="mgr_services")])
+            await query.edit_message_text("➕ *Новый вариант*\n\nВыбери существующую услугу:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
+        if data.startswith("mgr_service_item_category:"):
+            try: category_id=int(data.split(":",1)[1])
+            except ValueError: category_id=0
+            cat=get_service_category(category_id)
+            if not cat: await query.answer("Услуга не найдена",show_alert=True); return
+            context.user_data.clear(); context.user_data.update(manager_service_step="item_name",manager_service_category_id=category_id)
+            await query.edit_message_text(f"➕ *{cat['name']}*\n\nВведи название нового варианта:",parse_mode="Markdown"); return
+        if data == "mgr_service_edit":
+            buttons=[[InlineKeyboardButton(c["name"],callback_data=f"mgr_service_edit_category:{c['id']}")] for c in get_service_categories()]; buttons.append([InlineKeyboardButton("⬅️ Услуги и цены",callback_data="mgr_services")])
+            await query.edit_message_text("✏️ *Изменение цены*\n\nВыбери услугу:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
+        if data.startswith("mgr_service_edit_category:"):
+            try: category_id=int(data.split(":",1)[1])
+            except ValueError: category_id=0
+            cat=get_service_category(category_id)
+            if not cat: await query.answer("Услуга не найдена",show_alert=True); return
+            buttons=[[InlineKeyboardButton(f"{i['name']} — {format_price(i['price'])} ₽",callback_data=f"mgr_service_price:{i['id']}")] for i in get_service_items(category_id)]; buttons.append([InlineKeyboardButton("⬅️ Услуги и цены",callback_data="mgr_services")])
+            await query.edit_message_text(f"✏️ *{cat['name']}*\n\nВыбери пункт:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
+        if data.startswith("mgr_service_price:"):
+            try: item_id=int(data.split(":",1)[1])
+            except ValueError: item_id=0
+            item=get_service_item(item_id)
+            if not item: await query.answer("Пункт не найден",show_alert=True); return
+            context.user_data.clear(); context.user_data.update(manager_service_step="price",manager_service_item_id=item_id)
+            await query.edit_message_text(f"✏️ *{item['name']}*\n\nТекущая цена: *{format_price(item['price'])} ₽*\n\nВведи новую цену:",parse_mode="Markdown"); return
+        if data == "mgr_region_edit":
+            buttons=[[InlineKeyboardButton(r,callback_data=f"mgr_region:{r}")] for r in PRICES]; buttons.append([InlineKeyboardButton("⬅️ Услуги и цены",callback_data="mgr_services")])
+            await query.edit_message_text("🧹 *Изменение цен зачистки*\n\nВыбери регион:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
+        if data.startswith("mgr_region:"):
+            region=data.split(":",1)[1]
+            if region not in PRICES: await query.answer("Регион не найден",show_alert=True); return
+            prices=get_region_prices(region)
+            buttons=[[InlineKeyboardButton(f"0–100% — {format_price(prices['0-100'])} ₽",callback_data=f"mgr_region_price:{region}:0-100")],[InlineKeyboardButton(f"50–100% — {format_price(prices['50-100'])} ₽",callback_data=f"mgr_region_price:{region}:50-100")],[InlineKeyboardButton(f"80–100% — {format_price(prices['80-100'])} ₽",callback_data=f"mgr_region_price:{region}:80-100")],[InlineKeyboardButton("⬅️ Цены зачистки",callback_data="mgr_region_edit")]]
+            await query.edit_message_text(f"🧹 *{region}*\n\nВыбери цену:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
+        if data.startswith("mgr_region_price:"):
+            parts=data.split(":",2)
+            if len(parts)!=3: return
+            region,tier=parts[1],parts[2]
+            if region not in PRICES or tier not in TIER_KEYS: await query.answer("Некорректная цена",show_alert=True); return
+            context.user_data.clear(); context.user_data.update(manager_service_step="region_price",manager_region=region,manager_tier=tier)
+            await query.edit_message_text(f"✏️ *{region} — {tier}*\n\nТекущая цена: *{format_price(get_region_prices(region)[tier])} ₽*\n\nВведи новую цену:",parse_mode="Markdown"); return
+
+        if data == "mgr_discount_add":
+            context.user_data["manager_discount_step"] = "type"
+            await query.edit_message_text(
+                "➕ *Добавление скидки*\n\nВыбери тип скидки:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💰 От суммы заказа", callback_data="mgr_discount_type:threshold")],
+                    [InlineKeyboardButton("🛒 На конкретную услугу", callback_data="mgr_discount_type:service")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="mgr_panel")],
+                ]), parse_mode="Markdown")
+            return
+        if data.startswith("mgr_discount_type:"):
+            kind = data.split(":", 1)[1]
+            context.user_data["manager_discount_kind"] = kind
+            context.user_data["manager_discount_step"] = "value_type"
+            await query.edit_message_text(
+                "💵 *Как задать размер скидки?*",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💰 В рублях", callback_data="mgr_discount_value_type:RUB")],
+                    [InlineKeyboardButton("📉 В процентах", callback_data="mgr_discount_value_type:%")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="mgr_discount_add")],
+                ]),
+                parse_mode="Markdown"
+            )
+            return
+        if data.startswith("mgr_discount_value_type:"):
+            value_type = data.split(":", 1)[1]
+            kind = context.user_data.get("manager_discount_kind")
+            context.user_data["manager_discount_value_type"] = value_type
+            if kind == "threshold":
+                context.user_data["manager_discount_step"] = "threshold"
+                await query.edit_message_text("💰 Введи минимальную сумму заказа в рублях, например `1000`.", parse_mode="Markdown")
+            elif kind == "service":
+                context.user_data["manager_discount_step"] = "service"
+                await query.edit_message_text("🛒 Введи точное название услуги, например `Крутки` или `Диковинки`.")
+            return
+        if data.startswith("mgr_discount_period:"):
+            choice = data.split(":", 1)[1]
+            if choice == "custom":
+                context.user_data["manager_discount_step"] = "expires_at"
+                await query.edit_message_text("🗓 Введи дату окончания в формате `ДД.ММ.ГГГГ ЧЧ:ММ`, например `30.09.2026 23:59`.", parse_mode="Markdown")
+                return
+            expires_at = None
+            if choice != "none":
+                try:
+                    expires_at = (datetime.now() + timedelta(days=int(choice))).strftime("%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    expires_at = None
+            context.user_data["manager_discount_expires_at"] = expires_at
+            active = get_active_discounts()
+            if active:
+                context.user_data["manager_discount_step"] = "replace_choice"
+                await query.edit_message_text(
+                    "⚠️ Уже есть активные скидки.\n\nОставить их или удалить перед добавлением новой?",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Оставить старые", callback_data="mgr_discount_keep")],
+                        [InlineKeyboardButton("🗑 Удалить старые", callback_data="mgr_discount_replace")],
+                    ])
+                )
+            else:
+                await finalize_discount_creation(update, context, delete_old=False)
+            return
+        if data == "mgr_discount_keep":
+            await finalize_discount_creation(update, context, delete_old=False)
+            return
+        if data == "mgr_discount_replace":
+            await finalize_discount_creation(update, context, delete_old=True)
+            return
+
+        if data == "mgr_discount_list":
+            rows = get_active_discounts()
+            text = "📋 *Активные скидки*\n\n" + (discount_description(rows) if rows else "Активных скидок нет.")
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="mgr_panel")]]), parse_mode="Markdown")
+            return
+        if data == "mgr_discount_manage":
+            rows = get_active_discounts()
+            buttons = [[InlineKeyboardButton(f"❌ Отключить #{r['id']}", callback_data=f"mgr_discount_disable:{r['id']}")] for r in rows]
+            buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="mgr_panel")])
+            text = "🗑 *Управление скидками*\n\n" + (discount_description(rows) if rows else "Активных скидок нет.")
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+            return
+        if data.startswith("mgr_discount_disable:"):
+            try:
+                discount_id = int(data.split(":", 1)[1])
+            except ValueError:
+                return
+            conn = db()
+            conn.execute("UPDATE discounts SET active=0 WHERE id=?", (discount_id,))
+            conn.commit()
+            conn.close()
+            await query.answer("Скидка отключена")
+            rows = get_active_discounts()
+            buttons = [[InlineKeyboardButton(f"❌ Отключить #{r['id']}", callback_data=f"mgr_discount_disable:{r['id']}")] for r in rows]
+            buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="mgr_panel")])
+            text = "🗑 *Управление скидками*\n\n" + (discount_description(rows) if rows else "Активных скидок нет.")
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+            return
+
+    if data == "prices":
+        await query.edit_message_text("💰 *Прайсы*\n\nВыбери раздел:", reply_markup=price_region_keyboard(), parse_mode="Markdown")
+        return
+
+    if data == "my_orders":
+        await show_my_orders(update, context, edit=True)
+        return
+
+    if data == "price_cleanup":
+        await query.edit_message_text("🧹 *Прайс зачистки по регионам*\n\nВыбери регион:", reply_markup=region_keyboard("price_region"), parse_mode="Markdown")
+        return
+
+    if data.startswith("price_region:"):
+        region = data.split(":", 1)[1]
+        if region not in PRICES:
+            await query.edit_message_text("❌ Регион не найден.", reply_markup=MAIN_MENU)
+            return
+        prices = get_region_prices(region)
+        text = (f"💰 *{region}*\n\n"
+                f"0–100% — *{price_with_discount_text(prices['0-100'], 'Зачистка по регионам')}*\n"
+                f"50–100% — *{price_with_discount_text(prices['50-100'], 'Зачистка по регионам')}*\n"
+                f"80–100% — *{price_with_discount_text(prices['80-100'], 'Зачистка по регионам')}*")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К зачистке", callback_data="price_cleanup")], [InlineKeyboardButton("🏠 Главное меню", callback_data="back")]])
+        await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+        return
+
+    if data.startswith("price_category_db:"):
+        try:
+            category_id=int(data.split(":",1)[1])
+        except ValueError:
+            category_id=0
+        category=get_service_category(category_id)
+        if not category:
+            await query.edit_message_text("❌ Раздел не найден.",reply_markup=price_region_keyboard()); return
+        await query.edit_message_text(f"💰 *{category['name']}*\n\n{service_category_text(category_id)}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К прайсам",callback_data="prices")],[InlineKeyboardButton("🏠 Главное меню",callback_data="back")]]),parse_mode="Markdown")
+        return
+
+    if data.startswith("price_category:"):
+        try:
+            index = int(data.split(":", 1)[1])
+            category = PRICE_CATEGORIES[index]
+        except (ValueError, IndexError):
+            await query.edit_message_text("❌ Раздел не найден.", reply_markup=MAIN_MENU)
+            return
+        text = f"💰 *{category}*\n\n{EXTRA_PRICES[category]}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К прайсам", callback_data="prices")], [InlineKeyboardButton("🏠 Главное меню", callback_data="back")]])
+        await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+        return
+
+    if data == "price_57":
+        await query.edit_message_text(
+            "💰 *Для 57+ рангов*\n\nВыбери раздел:",
+            reply_markup=rank57_keyboard("rank57_price_category"),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data.startswith("rank57_price_category:"):
+        try:
+            index = int(data.split(":", 1)[1])
+            category = RANK57_CATEGORIES[index]
+        except (ValueError, IndexError):
+            await query.edit_message_text("❌ Раздел не найден.", reply_markup=price_region_keyboard())
+            return
+        await query.edit_message_text(
+            f"💰 *{category}*\n\n{format_rank57_prices(category)}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К 57+", callback_data="price_57")], [InlineKeyboardButton("🏠 Главное меню", callback_data="back")]]),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "service_57":
+        orders[user_id] = {}
+        context.user_data.clear()
+        await query.edit_message_text(
+            "🛒 *Для 57+ рангов*\n\nВыбери раздел:",
+            reply_markup=rank57_keyboard("service57_category"),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data.startswith("service57_category:"):
+        try:
+            index = int(data.split(":", 1)[1])
+            category = RANK57_CATEGORIES[index]
+        except (ValueError, IndexError):
+            await query.edit_message_text("❌ Раздел не найден.", reply_markup=service_category_keyboard())
+            return
+        await query.edit_message_text(
+            f"🛒 *{category}*\n\n{format_rank57_prices(category)}\n\nВыбери вариант для заказа:",
+            reply_markup=rank57_item_keyboard(index),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data.startswith("rank57_item:"):
+        try:
+            _, category_index, item_index = data.split(":", 2)
+            category_index, item_index = int(category_index), int(item_index)
+            item = rank57_item_data(category_index, item_index)
+        except (ValueError, IndexError):
+            item = None
+        if not item:
+            await query.edit_message_text("❌ Услуга не найдена.", reply_markup=service_category_keyboard())
+            return
+        category, item_name, price = item
+        orders[user_id] = {"service": category, "service_item": item_name, "price": price}
+        context.user_data.clear()
+        context.user_data["waiting_for_login"] = True
+        await query.edit_message_text(
+            f"🛒 *Заказ услуги*\n\n*{category}*\n{item_name}\n\n"
+            "🔐 *Шаг 1 из 3*\n\n"
+            "Отправь почту (email), привязанную к аккаунту.\n\n"
+            "⚠️ Отправляй только данные от аккаунта, который используется для заказа.",
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "contact":
+        buttons = [
+            [InlineKeyboardButton("💬 @fishlme — менеджер", url="https://t.me/fishlme")],
+            [InlineKeyboardButton("💬 @devarapq — разработчик", url="https://t.me/devarapq")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        ]
+        text = (
+            "📞 *Связь*\n\n"
+            "💬 *@fishlme — менеджер*\n"
+            "Основной контакт для связи по заказам и вопросам.\n\n"
+            "🛠 *@devarapq — разработчик*\n"
+            "Связь с разработчиком только если менеджер не отвечает в течение нескольких часов."
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown"
+        )
+        return
+
+    if data == "cleanup":
+        orders[user_id] = {}
+        context.user_data.clear()
+        await query.edit_message_text("🛒 *Заказать услугу*\n\nВыбери нужную услугу:", reply_markup=service_category_keyboard(), parse_mode="Markdown")
+        return
+
+    if data == "cleanup_regions":
+        orders[user_id] = {"service": "Зачистка по регионам"}
+        context.user_data.clear()
+        await query.edit_message_text("🧹 *Зачистка по регионам*\n\nВыбери регион:", reply_markup=region_keyboard(), parse_mode="Markdown")
+        return
+
+    if data.startswith("service_category_db:"):
+        try:
+            category_id=int(data.split(":",1)[1])
+        except ValueError:
+            category_id=0
+        category=get_service_category(category_id)
+        if not category or not category["active"]:
+            await query.edit_message_text("❌ Услуга не найдена.",reply_markup=service_category_keyboard())
+            return
+        await query.edit_message_text(f"🛒 *{category['name']}*\n\n{service_category_text(category_id)}\n\nВыбери вариант для заказа:",reply_markup=service_item_keyboard(category_id),parse_mode="Markdown")
+        return
+
+    if data.startswith("service_category:"):
+        try:
+            category_name=PRICE_CATEGORIES[int(data.split(":",1)[1])]
+            category=next((c for c in get_service_categories() if c["name"]==category_name),None)
+        except (ValueError,IndexError):
+            category=None
+        if not category:
+            await query.edit_message_text("❌ Услуга не найдена.",reply_markup=MAIN_MENU)
+            return
+        await query.edit_message_text(f"🛒 *{category['name']}*\n\n{service_category_text(category['id'])}\n\nВыбери вариант для заказа:",reply_markup=service_item_keyboard(category['id']),parse_mode="Markdown")
+        return
+
+    if data.startswith("service_item_custom:"):
+        try: item_id=int(data.split(":",1)[1])
+        except ValueError: item_id=0
+        item=get_service_item(item_id)
+        if not item or not item["active"]:
+            await query.edit_message_text("❌ Пункт услуги не найден.",reply_markup=service_category_keyboard()); return
+        orders[user_id]={"service":item["category_name"],"service_item":item["name"],"quantity_unit":item["unit"],"unit_price":float(item["price"])}
+        context.user_data.clear(); context.user_data["waiting_for_quantity"]=True
+        shown_price = price_with_discount_text(item["price"], item["category_name"])
+        await query.edit_message_text(f"✏️ *{item['name']}*\n\nЦена: *{shown_price} за 1 {item['unit']}*\n\nВведи нужное количество:",parse_mode="Markdown")
+        return
+
+    if data.startswith("service_item_db:"):
+        try: item_id=int(data.split(":",1)[1])
+        except ValueError: item_id=0
+        item=service_item_data_db(item_id)
+        if not item:
+            await query.edit_message_text("❌ Этот пункт услуги недоступен.",reply_markup=service_category_keyboard()); return
+        if item["quantity_mode"]=="quantity":
+            orders[user_id]={"service":item["category_name"],"service_item":item["name"],"quantity_unit":item["unit"],"unit_price":float(item["price"])}
+            context.user_data.clear(); context.user_data["waiting_for_quantity"]=True
+            shown_price = price_with_discount_text(item["price"], item["category_name"])
+            await query.edit_message_text(f"✏️ *{item['name']}*\n\nЦена: *{shown_price} за 1 {item['unit']}*\n\nВведи нужное количество:",parse_mode="Markdown")
+            return
+        orders[user_id]={"service":item["category_name"],"service_item":item["name"],"price":float(item["price"])}
+        context.user_data.clear(); context.user_data["waiting_for_login"]=True
+        shown_price = price_with_discount_text(item["price"], item["category_name"])
+        await query.edit_message_text(f"🛒 *Заказ услуги*\n\n*{item['category_name']}*\n{item['name']}\n\n💰 Цена: *{shown_price}*\n\n🔐 *Шаг 1 из 3*\n\nОтправь почту (email), привязанную к аккаунту.",parse_mode="Markdown")
+        return
+
+    if data.startswith("custom_quantity:"):
+        # Compatibility with old inline keyboards.
+        parts=data.split(":")
+        if len(parts)!=3: return
+        kind,value=parts[1],parts[2]
+        if kind=="spins":
+            cat=next((c for c in get_service_categories() if c["name"]=="Крутки"),None); items=get_service_items(cat["id"]) if cat else []
+            unit_price=float(items[0]["price"]) if items else 24
+            shown_price=price_with_discount_text(unit_price, "Крутки")
+            order={"service":"Крутки","quantity_unit":"крутка","unit_price":unit_price}; prompt=f"✏️ *Крутки*\n\nЦена: *{shown_price} за 1 крутку*.\n\nВведи нужное количество круток:"
+        elif kind=="dikovinki":
+            try: region=list(DIKOVINKI_PRICES.keys())[int(value)]
+            except (ValueError,IndexError): return
+            cat=next((c for c in get_service_categories() if c["name"]=="Диковинки"),None); item=next((i for i in get_service_items(cat["id"]) if i["name"]==region),None) if cat else None
+            unit_price=float(item["price"]) if item else DIKOVINKI_PRICES[region]
+            shown_price=price_with_discount_text(unit_price, "Диковинки")
+            order={"service":"Диковинки","region":region,"quantity_unit":"шт.","unit_price":unit_price}; prompt=f"✏️ *Диковинки — {region}*\n\nЦена: *{shown_price} за 1 шт.*\n\nВведи нужное количество:"
+        elif kind=="okuly":
+            try: item_name=OKULY_PRICES[int(value)][0]
+            except (ValueError,IndexError): return
+            cat=next((c for c in get_service_categories() if c["name"]=="Окулы"),None); item=next((i for i in get_service_items(cat["id"]) if i["name"]==item_name),None) if cat else None
+            unit_price=float(item["price"]) if item else OKULY_PRICES[int(value)][1]
+            shown_price=price_with_discount_text(unit_price, "Окулы")
+            order={"service":"Окулы","service_item":item_name,"quantity_unit":"шт.","unit_price":unit_price}; prompt=f"✏️ *{item_name}*\n\nЦена: *{shown_price} за 1 шт.*\n\nВведи нужное количество:"
+        else: return
+        orders[user_id]=order; context.user_data.clear(); context.user_data["waiting_for_quantity"]=True
+        await query.edit_message_text(prompt,parse_mode="Markdown"); return
+
+    if data.startswith("service_item:"):
+        try:
+            _,ci,ii=data.split(":",2); ci=int(ci); ii=int(ii); category_name=PRICE_CATEGORIES[ci]; category=next((c for c in get_service_categories() if c["name"]==category_name),None); items=get_service_items(category["id"]) if category else []; item=items[ii]
+        except (ValueError,IndexError,KeyError): item=None
+        if not item:
+            await query.edit_message_text("❌ Пункт услуги не найден.",reply_markup=service_category_keyboard()); return
+        if item["quantity_mode"]=="quantity":
+            orders[user_id]={"service":item["category_name"],"service_item":item["name"],"quantity_unit":item["unit"],"unit_price":float(item["price"])}; context.user_data.clear(); context.user_data["waiting_for_quantity"]=True
+            await query.edit_message_text(f"✏️ *{item['name']}*\n\nЦена: *{format_price(item['price'])} ₽ за 1 {item['unit']}*\n\nВведи нужное количество:",parse_mode="Markdown"); return
+        orders[user_id]={"service":item["category_name"],"service_item":item["name"],"price":float(item["price"])}; context.user_data.clear(); context.user_data["waiting_for_login"]=True
+        await query.edit_message_text(f"🛒 *Заказ услуги*\n\n*{item['category_name']}*\n{item['name']}\n\n🔐 *Шаг 1 из 3*\n\nОтправь почту (email), привязанную к аккаунту.",parse_mode="Markdown"); return
+
+    if data.startswith("region:"):
+        region = data.split(":", 1)[1]
+        if region not in PRICES:
+            await query.edit_message_text("❌ Регион не найден. Нажми /start.", reply_markup=MAIN_MENU)
+            return
+        orders.setdefault(user_id, {})["region"] = region
+        if orders[user_id].get("service") == "Зачистка по регионам":
+            await query.edit_message_text(f"🧹 *{region}*\n\nВыбери объём зачистки:", reply_markup=tier_keyboard(region), parse_mode="Markdown")
+        else:
+            await query.edit_message_text(f"🧹 *{region}*\n\nВыбери объём зачистки:", reply_markup=tier_keyboard(region), parse_mode="Markdown")
+        return
+
+    if data.startswith("tier:"):
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in PRICES or parts[2] not in ("0", "1", "2"):
+            await query.edit_message_text("❌ Ошибка выбора. Нажми /start.", reply_markup=MAIN_MENU)
+            return
+        region, tier_index = parts[1], int(parts[2])
+        orders.setdefault(user_id, {})
+        orders[user_id].update(region=region, tier_index=tier_index, price=get_region_prices(region)[TIER_KEYS[tier_index]])
+        orders[user_id].setdefault("service", "Зачистка по регионам")
+        orders[user_id]["service_item"] = f"Зачистка {TIER_NAMES[tier_index]}"
+        context.user_data.clear()
+        context.user_data["waiting_for_login"] = True
+        shown_price = price_with_discount_text(orders[user_id]["price"], "Зачистка по регионам")
+        await query.edit_message_text(
+            f"🧹 *Зачистка по регионам*\n\nРегион: *{region}*\nОбъём: *{TIER_NAMES[tier_index]}*\n💰 Цена: *{shown_price}*\n\n"
+            "🔐 *Шаг 1 из 3*\n\n"
+            "Отправь почту (email), привязанную к аккаунту.\n\n"
+            "⚠️ Отправляй только данные от аккаунта, который используется для заказа.",
+            parse_mode="Markdown"
+        )
+
+    if data.startswith("region_tp_qty:"):
+        try:
+            _, order_id_s, qty_s = data.split(":", 2)
+            order_id = int(order_id_s)
+            quantity = int(qty_s)
+        except (ValueError, TypeError):
+            await query.answer("Некорректное количество ТП.", show_alert=True)
+            return
+
+        order = orders.get(update.effective_user.id)
+        if not order or order.get("id") != order_id:
+            await query.answer("Заказ не найден. Начните оформление заново.", show_alert=True)
+            return
+
+        base_price = float(order.get("price", 0))
+        # Existing regional tier prices are for 100% completion.
+        order["quantity"] = quantity
+        order["price"] = region_tp_price(base_price, quantity)
+
+        await query.answer()
+        await query.edit_message_text(
+            f"Вы выбрали **{quantity} ТП**.\n"
+            f"Стоимость: **{format_price(order['price'])} ₽**\n\n"
+            "Теперь продолжайте оформление заказа.",
+            parse_mode="Markdown",
+        )
+        return
+
+        return
+
+
+async def finalize_discount_creation(update: Update, context: ContextTypes.DEFAULT_TYPE, delete_old=False):
+    kind = context.user_data.get("manager_discount_kind")
+    threshold = float(context.user_data.get("manager_discount_threshold", 0))
+    service = context.user_data.get("manager_discount_service", "")
+    percent = float(context.user_data.get("manager_discount_percent", 0))
+    value_type = context.user_data.get("manager_discount_value_type", "%")
+    expires_at = context.user_data.get("manager_discount_expires_at")
+    conn = db()
+    if delete_old:
+        conn.execute("UPDATE discounts SET active=0 WHERE active=1")
+    conn.execute("INSERT INTO discounts (kind, threshold, service, percent, value_type, active, created_at, expires_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                 (kind, threshold, service, percent, value_type, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expires_at))
+    conn.commit()
+    conn.close()
+    period = "без срока" if not expires_at else f"до {expires_at}"
+    context.user_data.clear()
+    msg = "🗑 Старые скидки отключены.\n\n" if delete_old else ""
+    msg += f"✅ Скидка добавлена.\n⏱ Период: {period}"
+    if getattr(update, "callback_query", None):
+        await update.callback_query.edit_message_text(msg, reply_markup=manager_keyboard())
+    else:
+        await update.message.reply_text(msg, reply_markup=manager_keyboard())
+
+
+async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the three order data steps: email, password, Telegram username."""
+    user_id = update.effective_user.id
+    text = (update.message.text or "").strip()
+    if is_manager(update) and context.user_data.get("manager_service_step"):
+        step=context.user_data["manager_service_step"]
+        if step=="name":
+            if not text or len(text)>80: await update.message.reply_text("❌ Название должно содержать от 1 до 80 символов."); return
+            context.user_data["manager_service_name"]=text; context.user_data["manager_service_step"]="price"
+            await update.message.reply_text("💰 Введи цену первой услуги в рублях, например 150."); return
+        if step=="price":
+            try: value=float(text.replace(",","."))
+            except ValueError: await update.message.reply_text("❌ Введи цену числом."); return
+            if value<=0 or value>1_000_000: await update.message.reply_text("❌ Цена должна быть от 0 до 1 000 000 ₽."); return
+            item_id=context.user_data.get("manager_service_item_id")
+            conn=db()
+            if item_id:
+                conn.execute("UPDATE service_items SET price=? WHERE id=?",(value,item_id)); conn.commit(); conn.close(); context.user_data.clear(); await update.message.reply_text("✅ Цена изменена.",reply_markup=manager_keyboard()); return
+            name=context.user_data.get("manager_service_name")
+            if not name: conn.close(); context.user_data.clear(); await update.message.reply_text("❌ Не удалось определить услугу.",reply_markup=manager_keyboard()); return
+            sort_order=conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM service_categories").fetchone()[0]
+            cur=conn.execute("INSERT INTO service_categories(name,active,sort_order) VALUES (?,1,?)",(name,sort_order)); cid=cur.lastrowid
+            conn.execute("INSERT INTO service_items(category_id,name,price,quantity_mode,unit,active,sort_order) VALUES (?,?,?,'fixed','шт.',1,0)",(cid,name,value)); conn.commit(); conn.close(); context.user_data.clear()
+            await update.message.reply_text(f"✅ Услуга {name} добавлена с ценой {format_price(value)} ₽.",reply_markup=manager_keyboard()); return
+        if step=="item_name":
+            if not text or len(text)>100: await update.message.reply_text("❌ Название должно содержать от 1 до 100 символов."); return
+            context.user_data["manager_service_item_name"]=text; context.user_data["manager_service_step"]="item_price"; await update.message.reply_text("💰 Введи цену варианта в рублях:"); return
+        if step=="item_price":
+            try: value=float(text.replace(",","."))
+            except ValueError: await update.message.reply_text("❌ Введи цену числом."); return
+            if value<=0 or value>1_000_000: await update.message.reply_text("❌ Цена должна быть от 0 до 1 000 000 ₽."); return
+            cid=context.user_data.get("manager_service_category_id"); name=context.user_data.get("manager_service_item_name")
+            if not cid or not name: context.user_data.clear(); await update.message.reply_text("❌ Не удалось сохранить вариант.",reply_markup=manager_keyboard()); return
+            conn=db(); sort_order=conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM service_items WHERE category_id=?",(cid,)).fetchone()[0]
+            conn.execute("INSERT INTO service_items(category_id,name,price,quantity_mode,unit,active,sort_order) VALUES (?,?,?,'fixed','шт.',1,?)",(cid,name,value,sort_order)); conn.commit(); conn.close(); context.user_data.clear(); await update.message.reply_text("✅ Вариант добавлен.",reply_markup=manager_keyboard()); return
+        if step=="region_price":
+            try: value=float(text.replace(",","."))
+            except ValueError: await update.message.reply_text("❌ Введи цену числом."); return
+            if value<=0 or value>1_000_000: await update.message.reply_text("❌ Цена должна быть от 0 до 1 000 000 ₽."); return
+            region=context.user_data.get("manager_region"); tier=context.user_data.get("manager_tier")
+            if region not in PRICES or tier not in TIER_KEYS: context.user_data.clear(); await update.message.reply_text("❌ Регион или уровень не найден.",reply_markup=manager_keyboard()); return
+            columns={"0-100":"price_0_100","50-100":"price_50_100","80-100":"price_80_100"}; conn=db(); conn.execute(f"UPDATE region_price_overrides SET {columns[tier]}=? WHERE region=?",(value,region)); conn.commit(); conn.close(); context.user_data.clear(); await update.message.reply_text("✅ Цена зачистки изменена.",reply_markup=manager_keyboard()); return
+
+    # Manager discount setup is independent of customer orders.
+    if is_manager(update) and context.user_data.get("manager_discount_step"):
+        step = context.user_data.get("manager_discount_step")
+        if step == "threshold":
+            try:
+                threshold = float(text.replace(",", "."))
+            except ValueError:
+                await update.message.reply_text("❌ Введи сумму числом, например 1000.")
+                return
+            if threshold <= 0:
+                await update.message.reply_text("❌ Сумма должна быть больше 0.")
+                return
+            context.user_data["manager_discount_threshold"] = threshold
+            context.user_data["manager_discount_step"] = "value"
+            unit = "процентах" if context.user_data.get("manager_discount_value_type", "%") == "%" else "рублях"
+            example = "10" if unit == "процентах" else "100"
+            await update.message.reply_text(f"📉 Введи размер скидки в {unit}, например `{example}`.", parse_mode="Markdown")
+            return
+        if step == "service":
+            if len(text) > 100:
+                await update.message.reply_text("❌ Слишком длинное название услуги.")
+                return
+            context.user_data["manager_discount_service"] = text
+            context.user_data["manager_discount_step"] = "value"
+            unit = "процентах" if context.user_data.get("manager_discount_value_type", "%") == "%" else "рублях"
+            example = "15" if unit == "процентах" else "100"
+            await update.message.reply_text(f"📉 Введи размер скидки в {unit}, например `{example}`.", parse_mode="Markdown")
+            return
+        if step in ("percent", "value"):
+            value_type = context.user_data.get("manager_discount_value_type", "%")
+            try:
+                value = float(text.replace(",", "."))
+            except ValueError:
+                unit = "процент" if value_type == "%" else "рублей"
+                await update.message.reply_text(f"❌ Введи размер скидки числом в {unit}, например 10.")
+                return
+            if value <= 0:
+                await update.message.reply_text("❌ Размер скидки должен быть больше 0.")
+                return
+            if value_type == "%" and value > 100:
+                await update.message.reply_text("❌ Процент должен быть от 0.01 до 100.")
+                return
+            context.user_data["manager_discount_percent"] = value
+            context.user_data["manager_discount_step"] = "period"
+            await update.message.reply_text(
+                "⏱ *Период действия скидки*\n\nВыбери срок:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("♾ Без срока", callback_data="mgr_discount_period:none")],
+                    [InlineKeyboardButton("📅 1 день", callback_data="mgr_discount_period:1")],
+                    [InlineKeyboardButton("📅 7 дней", callback_data="mgr_discount_period:7")],
+                    [InlineKeyboardButton("📅 30 дней", callback_data="mgr_discount_period:30")],
+                    [InlineKeyboardButton("🗓 До указанной даты", callback_data="mgr_discount_period:custom")],
+                ]), parse_mode="Markdown")
+            return
+
+        if step == "expires_at":
+            try:
+                dt = datetime.strptime(text, "%d.%m.%Y %H:%M")
+                if dt <= datetime.now():
+                    await update.message.reply_text("❌ Дата окончания должна быть в будущем.")
+                    return
+                context.user_data["manager_discount_expires_at"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                await update.message.reply_text("❌ Неверный формат. Пример: 30.09.2026 23:59")
+                return
+            active = get_active_discounts()
+            if active:
+                context.user_data["manager_discount_step"] = "replace_choice"
+                await update.message.reply_text(
+                    "⚠️ Уже есть активные скидки. Оставить их или удалить перед добавлением новой?",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Оставить старые", callback_data="mgr_discount_keep")],
+                        [InlineKeyboardButton("🗑 Удалить старые", callback_data="mgr_discount_replace")],
+                    ])
+                )
+            else:
+                await finalize_discount_creation(update, context, delete_old=False)
+            return
+
+    order = orders.get(user_id)
+
+    if not order:
+        return
+
+    # 0. Произвольное количество
+    if context.user_data.get("waiting_for_quantity"):
+        if not re.fullmatch(r"[1-9]\d{0,5}", text):
+            await update.message.reply_text("❌ Введи целое положительное количество, например: 37.")
+            return
+        quantity = int(text)
+        if quantity > 100000:
+            await update.message.reply_text("❌ Максимальное количество — 100000 шт.")
+            return
+
+        order["quantity"] = quantity
+        order["price"] = round(quantity * float(order["unit_price"]), 2)
+        context.user_data["waiting_for_quantity"] = False
+        context.user_data["waiting_for_login"] = True
+
+        if order.get("service") == "Диковинки":
+            item_line = f"{order['region']} — {quantity} шт. × {format_price(order['unit_price'])} ₽"
+        elif order.get("service") == "Окулы":
+            item_line = f"{order['service_item']} — {quantity} шт. × {format_price(order['unit_price'])} ₽"
+        elif order.get("service") == "Телепорты":
+            item_line = f"{order['service_item']} — {quantity} ТП × {format_price(order['unit_price'])} ₽"
+        else:
+            item_line = f"{quantity} круток × {format_price(order['unit_price'])} ₽"
+        order["service_item"] = item_line
+
+        await update.message.reply_text(
+            f"✅ Количество: *{quantity}*\n"
+            f"💰 Стоимость: *{format_price(get_service_discounted_price(order['price'], order.get('service')))} ₽*"
+            + (f" (было {format_price(order['price'])} ₽)" if get_service_discounted_price(order['price'], order.get('service')) < float(order['price']) else "")
+            + "\n\n"
+            "🔐 *Шаг 1 из 3*\n\n"
+            "Отправь почту (email), привязанную к аккаунту.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # 1. Email/login
+    if context.user_data.get("waiting_for_login"):
+        email_pattern = r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+        if len(text) > 254 or not re.fullmatch(email_pattern, text):
+            await update.message.reply_text(
+                "❌ Это не похоже на корректный адрес электронной почты.\n\n"
+                "Отправь почту аккаунта ещё раз, например: `example@mail.com`",
+                parse_mode="Markdown",
+            )
+            return
+        order["login"] = text
+        context.user_data["waiting_for_login"] = False
+        context.user_data["waiting_for_password"] = True
+        await update.message.reply_text(
+            "🔐 *Шаг 2 из 3*\n\nОтправь пароль аккаунта.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # 2. Password
+    if context.user_data.get("waiting_for_password"):
+        if not text or len(text) > 256:
+            await update.message.reply_text("❌ Некорректный пароль. Отправь пароль ещё раз.")
+            return
+        order["password"] = text
+        context.user_data["waiting_for_password"] = False
+        context.user_data["waiting_for_tg_username"] = True
+        await update.message.reply_text(
+            "🔐 *Шаг 3 из 3*\n\nОтправь свой Telegram-юзернейм.\n\n"
+            "Например: @username",
+            parse_mode="Markdown",
+        )
+        return
+
+    # 3. Telegram username
+    if context.user_data.get("waiting_for_tg_username"):
+        username = text.strip()
+        normalized = username if username.startswith("@") else "@" + username
+        username_without_at = normalized[1:]
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", username_without_at):
+            await update.message.reply_text(
+                "❌ Некорректный Telegram-юзернейм.\n\n"
+                "Отправь юзернейм в формате @username.\n"
+                "Допустимы латинские буквы, цифры и символ _."
+            )
+            return
+
+        order["telegram_username"] = normalized
+        context.user_data["waiting_for_tg_username"] = False
+
+        display_name = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.full_name
+        if "tier_index" in order:
+            service_line = f"🧹 Зачистка: *{TIER_NAMES[order['tier_index']]}*"
+        else:
+            service_line = f"🛒 Услуга: *{order.get('service', '')}*\n📦 Вариант: *{order.get('service_item', '')}*"
+        details_line = f"\n📝 Детали: {order.get('details')}" if order.get("details") and order.get("details").upper() != "НЕТ" else ""
+        base_price = float(order.get("price", 0))
+        applicable_discounts = get_applicable_discounts(order)
+        final_price, discount_amount = calculate_discount(base_price, applicable_discounts, mode="sequential")
+        if discount_amount > 0:
+            price_line = f"💰 Цена: *{format_price(final_price)} ₽* (было {format_price(base_price)} ₽)\n💸 Скидка: *{format_price(discount_amount)} ₽*"
+        else:
+            price_line = f"💰 Цена: *{format_price(base_price)} ₽*"
+        summary = (
+            "🧾 *Проверь заказ*\n\n"
+            f"👤 Клиент: {display_name}\n"
+            f"💬 Telegram: *{order['telegram_username']}*\n"
+            f"📍 Регион: *{order.get('region', 'Не требуется')}*\n"
+            f"{service_line}\n"
+            f"{price_line}"
+            f"{details_line}\n\n"
+            "🔐 Данные для входа будут переданы менеджерам только после подтверждения заказа.\n\n"
+            "⚠️ После выполнения заказа рекомендуется изменить пароль.\n\n"
+            "Всё верно?"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Подтвердить заказ", callback_data="confirm_order")],
+            [InlineKeyboardButton("❌ Отменить", callback_data="cancel_order")],
+        ])
+        await update.message.reply_text(summary, reply_markup=kb, parse_mode="Markdown")
+        return
+
+    logger.info("Ignoring text from user %s: no active order step", user_id)
+
+
+async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    order = orders.get(user_id)
+    if not order:
+        await query.edit_message_text("❌ Заказ не найден. Нажми /start.", reply_markup=MAIN_MENU)
+        return
+    display_name = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.full_name
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    base_price = float(order["price"])
+    applicable = get_applicable_discounts(order)
+    # If several discounts apply, the manager chooses the method. The order is
+    # created at base price first; credentials are sent only after the choice.
+    if len(applicable) > 1:
+        final_price = base_price
+        discount_amount = 0.0
+        discount_mode = "pending"
+    elif len(applicable) == 1:
+        final_price, discount_amount = calculate_discount(base_price, applicable, mode="sequential")
+        discount_mode = "automatic"
+    else:
+        final_price, discount_amount, discount_mode = base_price, 0.0, "none"
+
+    conn = db()
+    tier_name = TIER_NAMES[order["tier_index"]] if "tier_index" in order else order.get("service_item", order.get("service", "Услуга"))
+    cur = conn.execute("INSERT INTO orders (created_at, client_telegram_id, client_name, uid, server, region, tier, price, service, details, original_price, discount_amount, discount_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (now, user_id, display_name, "", "", order.get("region", "Не требуется"), tier_name, final_price, order.get("service", "Зачистка по регионам"), order.get("details", ""), base_price, discount_amount, discount_mode))
+    order_id = cur.lastrowid
+    conn.commit()
+    row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    conn.close()
+
+    credentials_text = (
+        f"🔐 *Данные для входа — заказ №{order_id}*\n\n"
+        f"👤 Клиент: {display_name}\n"
+        f"🔑 Логин: `{order['login']}`\n"
+        f"🔒 Пароль: `{order['password']}`\n"
+        f"💬 Telegram-юзернейм: `{order['telegram_username']}`\n\n"
+        "⚠️ Эти данные не сохраняются в orders.db. Они находятся только в памяти бота до оформления заказа и затем очищаются. "
+        "После выполнения заказа рекомендуется удалить сообщение с данными для входа и изменить пароль."
+    )
+
+    admin_status = ""
+    if ADMIN_CHAT_IDS:
+        sent, failed = await send_to_admin_chats(
+            context,
+            format_admin_order(row),
+            parse_mode="Markdown",
+            reply_markup=admin_keyboard(order_id),
+        )
+        if sent:
+            if len(applicable) > 1:
+                context.application.bot_data.setdefault("pending_credentials", {})[order_id] = credentials_text
+                choice_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Сложить проценты", callback_data=f"discount_sum:{order_id}")],
+                    [InlineKeyboardButton("🔄 Последовательно", callback_data=f"discount_seq:{order_id}")],
+                ])
+                await send_to_admin_chats(
+                    context,
+                    format_discount_choice(order_id, applicable),
+                    parse_mode="Markdown",
+                    reply_markup=choice_kb,
+                )
+                admin_status = "Заявка отправлена менеджерам. Менеджер выберет способ применения скидок."
+            else:
+                await send_to_admin_chats(context, credentials_text)
+                admin_status = "Заявка и данные для входа отправлены менеджерам."
+            if failed:
+                admin_status += " ⚠️ Не удалось отправить одному из чатов менеджеров."
+        else:
+            admin_status = "⚠️ Заказ сохранён, но не удалось отправить его в чаты менеджеров. Проверь ADMIN_CHAT_IDS."
+    else:
+        admin_status = "⚠️ ADMIN_CHAT_IDS пока не настроен."
+
+    username_mgr = MANAGER_USERNAME.strip().lstrip("@")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Связаться с менеджером", url=f"https://t.me/{username_mgr}")], [InlineKeyboardButton("🏠 Главное меню", callback_data="back")]])
+    await query.edit_message_text("✅ *Заказ оформлен!*\n\n" + admin_status + "\n\nОжидай ответа менеджера.", reply_markup=kb, parse_mode="Markdown")
+    orders.pop(user_id, None)
+    context.user_data.clear()
+
+
+async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Заказ отменён")
+    orders.pop(update.effective_user.id, None)
+    context.user_data.clear()
+    await query.edit_message_text(f"🎮 *{SHOP_NAME}*\n\nЗаказ отменён. Выбери раздел:", reply_markup=MAIN_MENU, parse_mode="Markdown")
+
+
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает справку в зависимости от типа пользователя."""
+    if is_manager(update):
+        text = (
+            "👨‍💼 *Помощь для менеджера*\n\n"
+            "*Команды:*\n"
+            "• `/start` — открыть главное меню.\n"
+            "• `/menu` — снова открыть главное меню.\n"
+            "• `/help` — показать эту справку.\n"
+            "• `/manager` — открыть панель менеджера.\n"
+            "• `/orders` — показать активные заказы и управление ими.\n"
+            "• `/allorders` — посмотреть список заказов.\n"
+            "• `/backup` — вручную сделать бэкап базы данных и кода на GitHub.\n"
+            "• `/chatid` — показать ID текущего Telegram-чата.\n\n"
+            "*Клиентский функционал:*\n"
+            "• 💰 *Прайсы* — просмотр актуальных цен по доступным услугам.\n"
+            "• 🛒 *Заказать услугу* — оформление заказа. При оформлении клиент указывает email, пароль и Telegram-юзернейм.\n"
+            "• 📋 *Мои заказы* — просмотр последних заказов клиента.\n"
+            "• 📞 *Связь* — контакты для связи.\n"
+            "• Для услуг с количеством можно указать нужное количество; стоимость рассчитывается с учётом количества.\n"
+            "• Если для заказа подходят несколько скидок, менеджер выбирает способ их применения.\n\n"
+            "*Функции менеджера:*\n"
+            "• 📦 *Все заказы* — просмотр заказов и изменение их статуса: взять, взять в работу, выполнить или отменить.\n"
+            "• 🏷 *Скидки* — добавление, просмотр и отключение скидок; скидки могут быть в рублях или процентах.\n"
+            "• 🛠 *Услуги и цены* — добавление услуг и вариантов, изменение цен и цен зачистки по регионам.\n"
+            "• 💾 *Сделать бэкап* — ручной GitHub-бэкап базы данных и кода.\n"
+            "• После изменения статуса заказа клиент получает уведомление.\n"
+        )
+    else:
+        text = (
+            "📖 *Помощь Fishl Shop*\n\n"
+            "*Доступные команды:*\n"
+            "• `/start` — запустить бота и открыть главное меню.\n"
+            "• `/menu` — открыть главное меню.\n"
+            "• `/myorders` — посмотреть свои последние заказы.\n"
+            "• `/help` — показать эту справку.\n\n"
+            "*Доступные функции:*\n"
+            "• 💰 *Прайсы* — посмотреть цены на доступные услуги.\n"
+            "• 🛒 *Заказать услугу* — выбрать услугу и оформить заказ.\n"
+            "• 📋 *Мои заказы* — посмотреть свои заказы и их статусы.\n"
+            "• 📞 *Связь* — открыть контакты для связи.\n"
+            "• При оформлении заказа нужно указать email, пароль и Telegram-юзернейм.\n"
+            "• Для услуг с количеством можно выбрать или ввести нужное количество; итоговая цена зависит от количества.\n"
+            "• Если действует скидка, она применяется к заказу по правилам магазина.\n"
+            "• После изменения статуса заказа менеджером бот отправляет уведомление.\n\n"
+            "*Контакты менеджеров:*\n"
+            "💬 @fishlme — менеджер\n"
+            "💬 @devarapq — менеджер\n"
+        )
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def my_orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_my_orders(update, context, edit=False)
+
+
+async def manager_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открывает панель менеджера по команде /manager.
+
+    Отдельная реализация здесь нужна, чтобы команда не зависела от
+    callback-логики кнопок панели.
+    """
+    if not is_manager(update):
+        await update.message.reply_text("❌ Доступ запрещён.")
+        return
+
+    try:
+        await update.message.reply_text(
+            "👨‍💼 *Панель менеджера*\n\nВыбери действие:",
+            reply_markup=manager_keyboard(),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Failed to open manager panel via /manager")
+        await update.message.reply_text("❌ Не удалось открыть панель менеджера. Проверь логи Railway.")
+
+
+async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_manager(update):
+        return
+    conn = db()
+    rows = conn.execute("SELECT * FROM orders WHERE status IN ('new','taken','working') ORDER BY id DESC LIMIT 20").fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("📭 Активных заказов нет.")
+        return
+    for row in rows:
+        await update.message.reply_text(format_admin_order(row), parse_mode="Markdown", reply_markup=admin_keyboard(row["id"], row["status"]))
+
+
+async def all_orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_manager_all_orders(update, context, edit=False)
+
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_manager(update):
+        return
+    try:
+        ok = upload_github_backup()
+        await update.message.reply_text(
+            "✅ Бэкап БД и кода загружен на GitHub." if ok else "⚠️ GitHub-бэкап не настроен. Проверь GITHUB_* в Railway.",
+            reply_markup=manager_keyboard(),
+        )
+    except Exception as exc:
+        logger.exception("Manual GitHub backup command failed")
+        await update.message.reply_text(f"❌ Не удалось сделать бэкап: {exc}")
+
+
+async def apply_order_discount_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_manager(update):
+        await query.answer("Недоступно", show_alert=True)
+        return
+    await query.answer()
+    parts = query.data.split(":")
+    if len(parts) != 2:
+        return
+    try:
+        order_id = int(parts[1])
+    except ValueError:
+        return
+    mode = "summed" if query.data.startswith("discount_sum:") else "sequential"
+    conn = db()
+    row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not row:
+        conn.close()
+        await query.edit_message_text("❌ Заказ не найден.")
+        return
+    # Rebuild the applicable rules from the current active discount set.
+    order_for_calc = {"price": row["original_price"] if row["original_price"] is not None else row["price"], "service": row["service"]}
+    applicable = get_applicable_discounts(order_for_calc)
+    base = float(order_for_calc["price"])
+    final, amount = calculate_discount(base, applicable, mode=mode)
+    conn.execute("UPDATE orders SET price=?, original_price=?, discount_amount=?, discount_mode=? WHERE id=?", (final, base, amount, mode, order_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    conn.close()
+    await query.edit_message_text(format_admin_order(row), parse_mode="Markdown", reply_markup=admin_keyboard(order_id, row["status"]))
+
+    # Credentials are kept only in process memory until the manager resolves the discount.
+    pending = context.application.bot_data.get("pending_credentials", {}).pop(order_id, None)
+    if pending and ADMIN_CHAT_IDS:
+        await send_to_admin_chats(context, pending)
+
+
+async def order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_manager(update):
+        await query.answer("Недоступно", show_alert=True)
+        return
+    await query.answer()
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        return
+    try:
+        order_id = int(parts[1])
+    except ValueError:
+        return
+    new_status = parts[2]
+    if new_status not in STATUS_LABELS:
+        return
+    manager = f"@{query.from_user.username}" if query.from_user.username else query.from_user.full_name
+    conn = db()
+    row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not row:
+        conn.close()
+        await query.edit_message_text("❌ Заказ не найден.")
+        return
+    conn.execute("UPDATE orders SET status=?, manager_name=? WHERE id=?", (new_status, manager, order_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    conn.close()
+
+    # Notify the client when a manager changes the order status.
+    client_messages = {
+        "taken": f"🟡 Заказ №{order_id} взят менеджером {manager}.",
+        "working": f"🔵 Заказ №{order_id} взят в работу менеджером {manager}.",
+        "done": f"✅ Заказ №{order_id} выполнен. Спасибо за заказ!",
+        "cancelled": f"❌ Заказ №{order_id} отменён. Если это произошло по ошибке, свяжись с менеджером.",
+    }
+    if new_status in client_messages:
+        try:
+            await context.bot.send_message(chat_id=row["client_telegram_id"], text=client_messages[new_status])
+        except Exception:
+            logger.exception("Failed to notify client for order %s", order_id)
+
+    await query.edit_message_text(format_admin_order(row), parse_mode="Markdown", reply_markup=admin_keyboard(order_id, new_status))
+
+
+async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat:
+        await update.message.reply_text(f"ID этого чата: `{update.effective_chat.id}`", parse_mode="Markdown")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled exception:", exc_info=context.error)
+
+
+async def set_bot_commands(application):
+    client_commands = [
+        BotCommand("start", "Запустить бота"),
+        BotCommand("menu", "Открыть главное меню"),
+        BotCommand("myorders", "Мои заказы"),
+        BotCommand("help", "Помощь"),
+    ]
+    manager_commands = client_commands + [
+        BotCommand("manager", "Панель менеджера"),
+        BotCommand("orders", "Активные заказы"),
+        BotCommand("allorders", "Все заказы"),
+        BotCommand("backup", "Сделать бэкап"),
+        BotCommand("chatid", "Показать ID чата"),
+    ]
+
+    await application.bot.set_my_commands(client_commands)
+    for chat_id in ADMIN_CHAT_IDS:
+        try:
+            await application.bot.set_my_commands(
+                manager_commands,
+                scope=BotCommandScopeChat(chat_id=chat_id),
+            )
+        except Exception:
+            logger.exception("Не удалось установить список команд для чата менеджера %s", chat_id)
+
+
+def main():
+    ensure_persistent_databases()
+    db().close()
+    app = Application.builder().token(BOT_TOKEN).post_init(set_bot_commands).build()
+    if github_backup_enabled():
+        interval = max(15, int(GITHUB_BACKUP_INTERVAL_MINUTES))
+        app.job_queue.run_repeating(scheduled_github_backup, interval=interval * 60, first=30)
+        logger.info("GitHub backups enabled: every %s minutes, branch=%s", interval, GITHUB_BACKUP_BRANCH)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("myorders", my_orders_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("manager", manager_command))
+    app.add_handler(CommandHandler("orders", orders_command))
+    app.add_handler(CommandHandler("allorders", all_orders_command))
+    app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("chatid", chat_id))
+    app.add_handler(CallbackQueryHandler(confirm_order, pattern=r"^confirm_order$"))
+    app.add_handler(CallbackQueryHandler(cancel_order, pattern=r"^cancel_order$"))
+    app.add_handler(CallbackQueryHandler(apply_order_discount_choice, pattern=r"^discount_(sum|seq):"))
+    app.add_handler(CallbackQueryHandler(order_status, pattern=r"^order_status:"))
+    app.add_handler(CallbackQueryHandler(manager_services_callback, pattern=r"^mgr_services$"))
+    app.add_handler(CallbackQueryHandler(button))
+    # One text handler dispatches to the correct step. Two separate catch-all
+    # handlers would both see the same message and could corrupt the flow.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text))
+    app.add_error_handler(error_handler)
+    print(f"{SHOP_NAME} bot started.")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
