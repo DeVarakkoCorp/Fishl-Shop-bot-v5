@@ -5,6 +5,8 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
+import traceback
 import tempfile
 import urllib.error
 import urllib.request
@@ -31,24 +33,45 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 class SecretRedactingFilter(logging.Filter):
+    # Match tokens both inside Telegram API URLs and when a library prints a
+    # bare token in an exception message.
     _token_pattern = re.compile(
-        r"(?i)(https?://api\.telegram\.org/bot|\bbot)[0-9]{5,}:[A-Za-z0-9_-]+"
+        r"(?i)(?:https?://api\.telegram\.org/bot|\bbot)?[0-9]{5,}:[A-Za-z0-9_-]{20,}"
     )
+
+    @classmethod
+    def redact(cls, value):
+        return cls._token_pattern.sub("[REDACTED]", str(value))
 
     def filter(self, record):
         try:
-            message = record.getMessage()
-            record.msg = self._token_pattern.sub(r"\1[REDACTED]", message)
+            record.msg = self.redact(record.getMessage())
             record.args = ()
-            if record.exc_text:
-                record.exc_text = self._token_pattern.sub(r"\1[REDACTED]", record.exc_text)
+            if record.exc_info:
+                # Redact exceptions before the formatter appends a traceback.
+                record.exc_text = self.redact("".join(traceback.format_exception(*record.exc_info)))
+                record.exc_info = None
+            elif record.exc_text:
+                record.exc_text = self.redact(record.exc_text)
             if record.stack_info:
-                record.stack_info = self._token_pattern.sub(r"\1[REDACTED]", record.stack_info)
+                record.stack_info = self.redact(record.stack_info)
         except Exception:
             # Logging must never crash application code.
             record.msg = "[log message redacted due to formatting error]"
             record.args = ()
+            record.exc_info = None
+            record.exc_text = None
         return True
+
+
+def _redacting_excepthook(exc_type, exc_value, exc_traceback):
+    """Redact token-shaped strings from uncaught exceptions before stderr output."""
+    rendered = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    sys.stderr.write(SecretRedactingFilter.redact(rendered))
+    sys.stderr.flush()
+
+
+sys.excepthook = _redacting_excepthook
 
 _secret_filter = SecretRedactingFilter()
 for _handler in logging.getLogger().handlers:
