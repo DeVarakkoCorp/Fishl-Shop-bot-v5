@@ -23,6 +23,37 @@ from config import (
 from prices import PRICES, EXTRA_PRICES, PRICE_CATEGORIES
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+
+# Telegram Bot API URLs contain the bot token in the URL path. Never emit
+# HTTP request URLs from httpx/httpcore, and redact token-shaped strings from
+# all ordinary log messages before they reach Railway logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+class SecretRedactingFilter(logging.Filter):
+    _token_pattern = re.compile(
+        r"(?i)(https?://api\.telegram\.org/bot|\bbot)[0-9]{5,}:[A-Za-z0-9_-]+"
+    )
+
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+            record.msg = self._token_pattern.sub(r"\1[REDACTED]", message)
+            record.args = ()
+            if record.exc_text:
+                record.exc_text = self._token_pattern.sub(r"\1[REDACTED]", record.exc_text)
+            if record.stack_info:
+                record.stack_info = self._token_pattern.sub(r"\1[REDACTED]", record.stack_info)
+        except Exception:
+            # Logging must never crash application code.
+            record.msg = "[log message redacted due to formatting error]"
+            record.args = ()
+        return True
+
+_secret_filter = SecretRedactingFilter()
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_secret_filter)
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
